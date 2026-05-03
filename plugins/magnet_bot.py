@@ -489,7 +489,7 @@ class Plugin(PluginBase):
         root.addSpacing(8)
 
         tol = NumericStepper(
-            _cfg.get("color_tolerance", default=35),
+            _cfg.get("color_tolerance", default=10),
             step=1, min_val=1, max_val=100, fmt="{:.0f}",
         )
         tol.changed.connect(lambda v: _cfg.set("color_tolerance", int(v)))
