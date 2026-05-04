@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton
 from hub_sdk import (
     PluginBase, T1, T2, T3, GREEN, AMBER, lbl, sep, kbd,
     make_tabs, section_header, NumericStepper,
+    is_plugin_active,
 )
 
 # ── config ────────────────────────────────────────────────────────────────────
@@ -128,7 +129,7 @@ class Plugin(PluginBase):
     DESCRIPTION = "Spams E → W → A on repeat. Auto-pauses the moment FiveM loses window focus."
     ACCENT      = "#60a5fa"
     TAGS        = ["FiveM", "Input"]
-    VERSION     = "1.1"
+    VERSION     = "1.1.1"
 
     def __init__(self):
         self._hk_gen    = 0
@@ -272,7 +273,8 @@ class Plugin(PluginBase):
             while self._hk_gen == my_gen:
                 try:
                     down = bool(win32api.GetAsyncKeyState(vk) & 0x8000)
-                    if down and not last and not self._capturing:
+                    if down and not last and not self._capturing \
+                            and is_plugin_active("Key Spammer"):
                         _bridge.toggle.emit()
                     last = down
                 except Exception:

@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton
 from hub_sdk import (
     PluginBase, T1, T2, T3, GREEN, AMBER, lbl, sep, kbd,
     make_tabs, section_header, NumericStepper,
+    is_plugin_active,
 )
 
 # ── config ────────────────────────────────────────────────────────────────────
@@ -135,7 +136,7 @@ class Plugin(PluginBase):
     DESCRIPTION = "Spams a key sequence for the weed bagging job. Auto-pauses when FiveM loses focus."
     ACCENT      = "#fbbf24"
     TAGS        = ["FiveM", "Job"]
-    VERSION     = "1.0"
+    VERSION     = "1.1.1"
 
     def __init__(self):
         self._hk_gen    = 0
@@ -327,7 +328,8 @@ class Plugin(PluginBase):
             while self._hk_gen == my_gen:
                 try:
                     down = bool(win32api.GetAsyncKeyState(vk) & 0x8000)
-                    if down and not last and not self._capturing:
+                    if down and not last and not self._capturing \
+                            and is_plugin_active("Weed Bagging"):
                         _bridge.toggle.emit()
                     last = down
                 except Exception:

@@ -25,6 +25,7 @@ from hub_sdk import (
     PluginBase, T1, T2, T3, GREEN, AMBER, lbl, sep, kbd,
     make_tabs, scrollable, section_header,
     ToggleSwitch, NumericStepper, ColorSwatch,
+    is_plugin_active,
 )
 from config import ConfigManager, LEVEL_PRESETS
 from bot import BotEngine, State, is_fivem_focused
@@ -109,7 +110,7 @@ class Plugin(PluginBase):
     DESCRIPTION = "Automated fishing minigame bot for FiveM. Scans for colored targets, auto-clicks, and tracks session stats."
     ACCENT      = "#4ade80"
     TAGS        = ["FiveM", "Automation"]
-    VERSION     = "1.1"
+    VERSION     = "1.1.1"
 
     def __init__(self):
         self._bot_state      = State.IDLE
@@ -591,8 +592,8 @@ class Plugin(PluginBase):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _build_stats(self):
-        page = QWidget()
-        root = QVBoxLayout(page)
+        inner = QWidget()
+        root  = QVBoxLayout(inner)
         root.setContentsMargins(0, 8, 0, 8)
         root.setSpacing(0)
 
@@ -619,14 +620,6 @@ class Plugin(PluginBase):
         rst_btn.setObjectName("action")
         rst_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         rst_btn.setFixedWidth(160)
-
-        def _reset_stats():
-            _cfg.set("stats", "lifetime_catches",   0)
-            _cfg.set("stats", "lifetime_sessions",  0)
-            _cfg.set("stats", "lifetime_runtime_s", 0)
-            _refresh_stats()
-
-        rst_btn.clicked.connect(_reset_stats)
         rst_row = QHBoxLayout(); rst_row.addStretch(); rst_row.addWidget(rst_btn)
         root.addLayout(rst_row)
         root.addSpacing(16)
@@ -658,6 +651,7 @@ class Plugin(PluginBase):
         # ── Adjustment Log ────────────────────────────────────────────────────
         adj_log = QTextEdit()
         adj_log.setReadOnly(True)
+        adj_log.setFixedHeight(90)
         adj_log.setStyleSheet(
             "QTextEdit { background:#0f0f0f; border:1px solid #1e1e1e;"
             " border-radius:6px; font-size:10px; color:#6b7280; padding:4px; }"
@@ -673,15 +667,68 @@ class Plugin(PluginBase):
         copy_btn.clicked.connect(_copy_log)
 
         log_hdr = QHBoxLayout()
-        log_hdr.setContentsMargins(0, 0, 0, 0)
-        log_hdr.setSpacing(0)
+        log_hdr.setContentsMargins(0, 0, 0, 0); log_hdr.setSpacing(0)
         log_hdr.addWidget(section_header("Adjustment Log"))
         log_hdr.addStretch()
         log_hdr.addWidget(copy_btn)
         root.addLayout(log_hdr)
         root.addSpacing(8)
         root.addWidget(adj_log)
+
+        root.addSpacing(16)
+        root.addWidget(sep())
+        root.addSpacing(12)
+
+        # ── Session History ────────────────────────────────────────────────────
+        _COL_LOOPS   = 52
+        _COL_RUNTIME = 56
+
+        def _hist_hrow(date_w, loops_w, rt_w, is_header=False):
+            row = QWidget(); row.setStyleSheet("background:transparent;")
+            h = QHBoxLayout(row)
+            h.setContentsMargins(4, 1 if is_header else 2, 4, 1 if is_header else 2)
+            h.setSpacing(0)
+            h.addWidget(date_w)
+            h.addStretch()
+            loops_w.setFixedWidth(_COL_LOOPS)
+            loops_w.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            h.addWidget(loops_w)
+            h.addSpacing(16)
+            rt_w.setFixedWidth(_COL_RUNTIME)
+            rt_w.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            h.addWidget(rt_w)
+            return row
+
+        clr_btn = QPushButton("Clear")
+        clr_btn.setObjectName("action")
+        clr_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clr_btn.setFixedWidth(56)
+
+        sh_hdr = QHBoxLayout()
+        sh_hdr.setContentsMargins(0, 0, 0, 0)
+        sh_hdr.addWidget(section_header("Session History"))
+        sh_hdr.addStretch()
+        sh_hdr.addWidget(clr_btn)
+        root.addLayout(sh_hdr)
+        root.addSpacing(6)
+
+        root.addWidget(_hist_hrow(
+            lbl("Date",    sz=10, col=T3),
+            lbl("Loops",   sz=10, col=T3),
+            lbl("Runtime", sz=10, col=T3),
+            is_header=True,
+        ))
+        root.addSpacing(4)
+        root.addWidget(sep())
+        root.addSpacing(4)
+
+        hist_w = QWidget(); hist_w.setStyleSheet("background:transparent;")
+        hist_v = QVBoxLayout(hist_w)
+        hist_v.setContentsMargins(0, 0, 0, 0); hist_v.setSpacing(1)
+        root.addWidget(hist_w)
         root.addStretch()
+
+        # ── refresh ────────────────────────────────────────────────────────────
 
         def _refresh_stats():
             lc_lbl.setText(str(_cfg.get("stats", "lifetime_catches",   default=0)))
@@ -695,14 +742,42 @@ class Plugin(PluginBase):
             ttfd_lbl.setText(f"{stats['avg_ttfd']:.2f}")
 
             adj_log.clear()
-            for entry in reversed(_adaptive.get_log()):   # oldest → newest
+            for entry in reversed(_adaptive.get_log()):
                 adj_log.append(f"[{entry['time']}] {entry['title']}: {entry['msg']}")
-            sb = adj_log.verticalScrollBar()
-            sb.setValue(sb.maximum())
+            sb = adj_log.verticalScrollBar(); sb.setValue(sb.maximum())
 
-        timer = QTimer(page); timer.timeout.connect(_refresh_stats); timer.start(2000)
+            # Session history — rebuild rows newest first
+            while hist_v.count():
+                item = hist_v.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            history = list(_cfg.get("stats", "session_history", default=[]))
+            if not history:
+                hist_v.addWidget(lbl("No sessions recorded yet.", sz=11, col=T3))
+            else:
+                for entry in reversed(history):
+                    hist_v.addWidget(_hist_hrow(
+                        lbl(entry.get("date", ""),                sz=11, col=T2),
+                        lbl(str(entry.get("loops", 0)),           sz=11, col=T1, bold=True),
+                        lbl(_fmt_time(entry.get("runtime_s", 0)), sz=11, col=T2),
+                    ))
+
+        def _reset_stats():
+            _cfg.set("stats", "lifetime_catches",   0)
+            _cfg.set("stats", "lifetime_sessions",  0)
+            _cfg.set("stats", "lifetime_runtime_s", 0)
+            _refresh_stats()
+
+        def _clear_history():
+            _cfg.set("stats", "session_history", [])
+            _refresh_stats()
+
+        rst_btn.clicked.connect(_reset_stats)
+        clr_btn.clicked.connect(_clear_history)
+
+        timer = QTimer(inner); timer.timeout.connect(_refresh_stats); timer.start(2000)
         _refresh_stats()
-        return page
+        return scrollable(inner)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Hotkeys tab
@@ -775,7 +850,7 @@ class Plugin(PluginBase):
             while self._hk_gen == my_gen:
                 try:
                     down = bool(win32api.GetAsyncKeyState(vk) & 0x8000)
-                    if down and not last:
+                    if down and not last and is_plugin_active("Magnet Bot"):
                         if self._engine.is_running:
                             self._engine.stop()
                         else:
@@ -832,6 +907,8 @@ class Plugin(PluginBase):
             return ""
 
         def on_press(key):
+            if not is_plugin_active("Magnet Bot"):
+                return
             ks = _key_str(key)
             if not ks:
                 return
