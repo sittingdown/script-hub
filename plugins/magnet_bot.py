@@ -214,10 +214,9 @@ class Plugin(PluginBase):
 
         sr = QHBoxLayout(); sr.setSpacing(0); sr.addStretch()
         lay, loops_lbl    = stat_pair("Loops");            sr.addLayout(lay); sr.addSpacing(28)
-        lay, catches_lbl  = stat_pair("Catches");          sr.addLayout(lay); sr.addSpacing(28)
-        lay, rate_lbl     = stat_pair("Catches / hr");     sr.addLayout(lay); sr.addSpacing(28)
+        lay, rate_lbl     = stat_pair("Loops / hr");       sr.addLayout(lay); sr.addSpacing(28)
         lay, runtime_lbl  = stat_pair("Runtime");          sr.addLayout(lay); sr.addSpacing(28)
-        lay, lifetime_lbl = stat_pair("Lifetime");         sr.addLayout(lay)
+        lay, sessions_lbl = stat_pair("Sessions");         sr.addLayout(lay)
         sr.addStretch()
         root.addLayout(sr)
         root.addSpacing(12)
@@ -302,12 +301,11 @@ class Plugin(PluginBase):
                 cd_bar.hide(); cd_lbl.hide()
 
             loops_lbl.setText(str(self._loops))
-            catches_lbl.setText(str(self._catches))
             rt   = self._engine.get_session_runtime() if running else 0.0
-            rate = self._engine.get_catch_rate()       if running else 0.0
+            rate = self._engine.get_loop_rate()        if running else 0.0
             runtime_lbl.setText(_fmt_time(rt))
             rate_lbl.setText(f"{rate:.1f}")
-            lifetime_lbl.setText(str(_cfg.get("stats", "lifetime_catches", default=0)))
+            sessions_lbl.setText(str(_cfg.get("stats", "lifetime_sessions", default=0)))
             colors_info.setText(_colors_text())
 
             for hk_name, chip in hk_chips.items():
