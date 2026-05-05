@@ -17,7 +17,7 @@ import win32api
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QButtonGroup, QPushButton,
-    QProgressBar, QTextEdit,
+    QProgressBar, QTextEdit, QFrame,
 )
 from pynput.keyboard import Listener
 
@@ -45,6 +45,7 @@ class _Bridge(QObject):
     hk_catch_region  = pyqtSignal()
     hk_color_picker  = pyqtSignal()
     hk_emergency     = pyqtSignal()
+    hk_pause         = pyqtSignal()
 
 _bridge = _Bridge()
 
@@ -54,6 +55,7 @@ _bridge.hk_wait_point.connect(  lambda: _plugin_ref[0] and _plugin_ref[0]._do_se
 _bridge.hk_catch_region.connect(lambda: _plugin_ref[0] and _plugin_ref[0]._do_select_catch_region())
 _bridge.hk_color_picker.connect(lambda: _plugin_ref[0] and _plugin_ref[0]._do_open_color_picker())
 _bridge.hk_emergency.connect(   lambda: _plugin_ref[0] and _plugin_ref[0]._do_emergency_stop())
+_bridge.hk_pause.connect(       lambda: _plugin_ref[0] and _plugin_ref[0]._do_pause())
 
 # ── adaptive engine ───────────────────────────────────────────────────────────
 _adaptive = AdaptiveEngine(
@@ -85,6 +87,138 @@ _STATE_TEXT = {
     State.CLICKING:   ("Clicking!",             GREEN),
     State.WAIT_END:   ("Cooldown…",             AMBER),
 }
+
+# Short labels for the in-game overlay
+_OV_TEXT = {
+    State.IDLE:       ("Stopped",   T3),
+    State.PRESS_E:    ("Pressing",  T2),
+    State.WAIT_START: ("Starting",  T2),
+    State.MOVE_MOUSE: ("Moving",    T2),
+    State.SCANNING:   ("Scanning",  GREEN),
+    State.CLICKING:   ("Clicking!", GREEN),
+    State.WAIT_END:   ("Cooldown",  AMBER),
+}
+
+# ── status overlay ─────────────────────────────────────────────────────────────
+
+class _StatusOverlay(QWidget):
+    """
+    Transparent, always-on-top, click-through overlay that shows bot state.
+    Normally passes all mouse/keyboard events through to whatever is below.
+    Becomes draggable when enter_move_mode() is called.
+    """
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowTransparentForInput,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setStyleSheet("background: transparent;")
+        self._drag_pos = None
+        self._move_mode = False
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self._card = QFrame()
+        self._card.setObjectName("ov_card")
+        self._card.setStyleSheet(
+            "QFrame#ov_card {"
+            "  background: rgba(8, 8, 8, 200);"
+            "  border-radius: 10px;"
+            "  border: 1px solid rgba(255,255,255,14);"
+            "}"
+            "QLabel { background: transparent; border: none; }"
+        )
+
+        row = QHBoxLayout(self._card)
+        row.setContentsMargins(10, 7, 13, 7)
+        row.setSpacing(7)
+
+        self._dot = QFrame()
+        self._dot.setFixedSize(8, 8)
+        self._dot.setStyleSheet(f"background:{T3}; border-radius:4px; border:none;")
+
+        from PyQt6.QtWidgets import QLabel as _QLabel
+        self._lbl = _QLabel("Stopped")
+        self._lbl.setStyleSheet(
+            f"color:{T3}; font-size:12px; font-weight:700;"
+            " font-family:'Segoe UI',sans-serif;"
+        )
+
+        row.addWidget(self._dot)
+        row.addWidget(self._lbl)
+        outer.addWidget(self._card)
+        self.adjustSize()
+
+    # ── state update ──────────────────────────────────────────────────────────
+
+    def set_state(self, text: str, color: str):
+        self._lbl.setText(text)
+        self._lbl.setStyleSheet(
+            f"color:{color}; font-size:12px; font-weight:700;"
+            " font-family:'Segoe UI',sans-serif;"
+        )
+        self._dot.setStyleSheet(
+            f"background:{color}; border-radius:4px; border:none;"
+        )
+        self.adjustSize()
+
+    # ── move mode ─────────────────────────────────────────────────────────────
+
+    def enter_move_mode(self):
+        """Remove click-through so the window can receive drag events."""
+        self._move_mode = True
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self._lbl.setText("Drag to move")
+        self._lbl.setStyleSheet(
+            "color:#60a5fa; font-size:12px; font-weight:700;"
+            " font-family:'Segoe UI',sans-serif;"
+        )
+        self._dot.setStyleSheet("background:#60a5fa; border-radius:4px; border:none;")
+        self.adjustSize()
+        self.show()
+
+    def exit_move_mode(self):
+        """Re-enable click-through."""
+        self._move_mode = False
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowTransparentForInput
+        )
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.show()
+
+    # ── drag support ──────────────────────────────────────────────────────────
+
+    def mousePressEvent(self, ev):
+        if self._move_mode and ev.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = (
+                ev.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            )
+            ev.accept()
+
+    def mouseMoveEvent(self, ev):
+        if self._move_mode and self._drag_pos is not None:
+            self.move(ev.globalPosition().toPoint() - self._drag_pos)
+            ev.accept()
+
+    def mouseReleaseEvent(self, ev):
+        self._drag_pos = None
+        ev.accept()
+
 
 # ── layout helper ──────────────────────────────────────────────────────────────
 def _hrow(*widgets):
@@ -122,9 +256,17 @@ class Plugin(PluginBase):
         self._badges         = {}     # hotkey name → QPushButton
         self._ik_capturing   = False  # interaction key capture flag
         self._ik_badge       = None   # interaction key badge ref
-        self._hk_listener     = None   # persistent pynput listener for setup hotkeys
-        self._rebuild_swatches = None  # set by _build_settings; called when colors change externally
-        _plugin_ref[0]        = self  # allows bridge signals to dispatch to us
+        self._hk_listener      = None   # persistent pynput listener for setup hotkeys
+        self._rebuild_swatches = None   # set by _build_settings; called when colors change externally
+        _plugin_ref[0]         = self  # allows bridge signals to dispatch to us
+
+        # Status overlay — created once, lives for the plugin's lifetime
+        self._overlay = _StatusOverlay()
+        _pos = _cfg.get("overlay_pos", default={"x": 20, "y": 60})
+        self._overlay.move(_pos.get("x", 20), _pos.get("y", 60))
+        if _cfg.get("overlay_enabled", default=False):
+            self._overlay.show()
+        _bridge.update.connect(self._update_overlay)
 
         def _on_state(s):
             self._bot_state = s
@@ -181,7 +323,8 @@ class Plugin(PluginBase):
         state_lbl = lbl("STOPPED", sz=22, col=T3, bold=True,
                         align=Qt.AlignmentFlag.AlignCenter)
         root.addWidget(state_lbl)
-        root.addSpacing(8)
+        root.addSpacing(6)
+
 
         # ── cooldown bar (hidden when idle) ───────────────────────────────────
         cd_bar = QProgressBar()
@@ -238,6 +381,7 @@ class Plugin(PluginBase):
         # ── hotkey quick-reference strip ──────────────────────────────────────
         _HK_REF = [
             ("toggle_bot",          "Toggle"),
+            ("pause_bot",           "Pause"),
             ("select_wait_point",   "Wait Pt"),
             ("select_catch_region", "Region"),
             ("open_color_picker",   "Colors"),
@@ -278,11 +422,19 @@ class Plugin(PluginBase):
                     if n else "No colors set — configure in Settings")
 
         def refresh():
-            running = self._engine.is_running
-            paused  = self._engine.is_paused or not is_fivem_focused()
+            running         = self._engine.is_running
+            manual_paused   = self._engine.is_paused
+            fivem_ok        = is_fivem_focused()
+            auto_pause_on   = _cfg.get("auto_pause_unfocused", default=True)
+            unfocus_paused  = auto_pause_on and not fivem_ok
+            any_paused      = manual_paused or unfocus_paused
 
-            if running and paused:
-                state_lbl.setText("PAUSED — focus FiveM")
+            if running and any_paused:
+                if manual_paused:
+                    pk, _ = _cfg.get_hotkey("pause_bot")
+                    state_lbl.setText(f"PAUSED — press {pk.upper()} to resume")
+                else:
+                    state_lbl.setText("PAUSED — focus FiveM")
                 state_lbl.setStyleSheet(
                     f"color:{AMBER}; font-size:22px; font-weight:700; background:transparent;")
             elif running:
@@ -584,6 +736,67 @@ class Plugin(PluginBase):
             root.addLayout(_hrow(lbl(opt_label, sz=12, col=T2), sw))
             root.addSpacing(8)
 
+        root.addSpacing(12)
+        root.addWidget(sep())
+        root.addSpacing(16)
+
+        # ── Status Overlay ────────────────────────────────────────────────────
+        root.addWidget(section_header("Status Overlay"))
+        root.addSpacing(6)
+        root.addWidget(lbl(
+            "Shows bot state on top of all windows — click-through, "
+            "never blocks FiveM input.",
+            sz=11, col=T3, wrap=True,
+        ))
+        root.addSpacing(12)
+
+        ov_sw   = ToggleSwitch(_cfg.get("overlay_enabled", default=False))
+        move_btn = QPushButton("Move")
+        move_btn.setObjectName("action")
+        move_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        move_btn.setFixedWidth(60)
+
+        _moving = [False]
+
+        def _on_ov_toggle(v):
+            _cfg.set("overlay_enabled", v)
+            ov = self._overlay
+            if v:
+                self._update_overlay()
+                ov.show()
+            elif not _moving[0]:
+                ov.hide()
+
+        def _on_move():
+            ov = self._overlay
+            if not _moving[0]:
+                _moving[0] = True
+                ov.show()
+                ov.enter_move_mode()
+                move_btn.setText("Done")
+            else:
+                _moving[0] = False
+                p = ov.pos()
+                _cfg.set("overlay_pos", {"x": p.x(), "y": p.y()})
+                ov.exit_move_mode()
+                if _cfg.get("overlay_enabled", default=False):
+                    self._update_overlay()
+                else:
+                    ov.hide()
+                move_btn.setText("Move")
+
+        ov_sw.toggled.connect(_on_ov_toggle)
+        move_btn.clicked.connect(_on_move)
+
+        ov_row = QHBoxLayout()
+        ov_row.setContentsMargins(0, 0, 0, 0); ov_row.setSpacing(10)
+        ov_row.addWidget(lbl("Show Overlay", sz=12, col=T2))
+        ov_row.addStretch()
+        ov_row.addWidget(move_btn)
+        ov_row.addSpacing(4)
+        ov_row.addWidget(ov_sw)
+        root.addLayout(ov_row)
+
         root.addStretch()
         return scrollable(inner)
 
@@ -791,6 +1004,7 @@ class Plugin(PluginBase):
 
         HOTKEYS = [
             ("toggle_bot",          "Toggle Bot"),
+            ("pause_bot",           "Pause / Resume"),
             ("select_wait_point",   "Select Wait Point"),
             ("select_catch_region", "Select Catch Region"),
             ("open_color_picker",   "Open Color Picker"),
@@ -882,6 +1096,7 @@ class Plugin(PluginBase):
         str_to_sig: dict = {}
         for hk_id, sig in [
             ("emergency_stop",      _bridge.hk_emergency),
+            ("pause_bot",           _bridge.hk_pause),
             ("select_wait_point",   _bridge.hk_wait_point),
             ("select_catch_region", _bridge.hk_catch_region),
             ("open_color_picker",   _bridge.hk_color_picker),
@@ -921,6 +1136,13 @@ class Plugin(PluginBase):
         self._hk_listener.start()
 
     # ── setup hotkey actions ──────────────────────────────────────────────────
+
+    def _do_pause(self):
+        """Toggle manual pause on the bot engine."""
+        if not self._engine.is_running:
+            return
+        self._engine.toggle_pause()
+        _bridge.update.emit()
 
     def _do_emergency_stop(self):
         self._engine.stop()
@@ -1038,6 +1260,22 @@ class Plugin(PluginBase):
 
     # ── on_unload ─────────────────────────────────────────────────────────────
 
+    # ── overlay state sync ────────────────────────────────────────────────────
+
+    def _update_overlay(self):
+        ov = self._overlay
+        if not ov.isVisible() or ov._move_mode:
+            return
+        running = self._engine.is_running
+        paused  = self._engine.is_paused or not is_fivem_focused()
+        if running and paused:
+            ov.set_state("Paused", AMBER)
+        elif running:
+            text, color = _OV_TEXT.get(self._bot_state, ("Running", GREEN))
+            ov.set_state(text, color)
+        else:
+            ov.set_state("Stopped", T3)
+
     def on_unload(self):
         """Stop all background threads before plugin is destroyed on hot-reload."""
         # Stop the bot engine (sets is_running = False, stops scan thread)
@@ -1056,6 +1294,17 @@ class Plugin(PluginBase):
 
         # Kill the toggle-bot poll thread by advancing the generation counter
         self._hk_gen += 1
+
+        # Disconnect overlay update signal and destroy the overlay window
+        try:
+            _bridge.update.disconnect(self._update_overlay)
+        except Exception:
+            pass
+        try:
+            self._overlay.hide()
+            self._overlay.deleteLater()
+        except Exception:
+            pass
 
         # Clear the module-level plugin reference so bridge signals are no-ops
         if _plugin_ref[0] is self:
