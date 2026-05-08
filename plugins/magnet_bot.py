@@ -13,11 +13,14 @@ from pathlib import Path
 # project root holds bot.py, config.py, adaptive.py, overlays_qt.py, etc.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import urllib.request
+import json as _json
 import win32api
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
+
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QButtonGroup, QPushButton,
-    QProgressBar, QTextEdit, QFrame,
+    QProgressBar, QTextEdit, QFrame, QLabel, QLineEdit,
 )
 from pynput.keyboard import Listener
 
@@ -30,6 +33,7 @@ from hub_sdk import (
 from config import ConfigManager, LEVEL_PRESETS
 from bot import BotEngine, State, is_fivem_focused
 from adaptive import AdaptiveEngine
+from detector import get_click_targets
 from overlays_qt import ColorPickerOverlay, RegionSelectorOverlay, PointSelectorOverlay
 
 # ── shared config ──────────────────────────────────────────────────────────────
@@ -37,9 +41,9 @@ _cfg = ConfigManager()
 
 # ── bridge: bot thread → Qt main thread ───────────────────────────────────────
 class _Bridge(QObject):
-    update   = pyqtSignal()
-    cooldown = pyqtSignal(float, float, str)   # elapsed, total, label
-    log_msg  = pyqtSignal(str)
+    update        = pyqtSignal()
+    cooldown      = pyqtSignal(float, float, str)   # elapsed, total, label
+    log_msg       = pyqtSignal(str)
     # setup hotkey triggers — emitted from pynput thread, delivered on main thread
     hk_wait_point    = pyqtSignal()
     hk_catch_region  = pyqtSignal()
@@ -103,9 +107,11 @@ _OV_TEXT = {
 
 class _StatusOverlay(QWidget):
     """
-    Transparent, always-on-top, click-through overlay that shows bot state.
+    Transparent, always-on-top, click-through overlay that shows bot state
+    plus optional info rows (loops, rate, runtime).
     Normally passes all mouse/keyboard events through to whatever is below.
     Becomes draggable when enter_move_mode() is called.
+    Auto-hides when the Magnet Bot plugin is not the active page.
     """
 
     def __init__(self):
@@ -122,6 +128,8 @@ class _StatusOverlay(QWidget):
         self._drag_pos = None
         self._move_mode = False
 
+        from PyQt6.QtWidgets import QLabel as _QLabel
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
@@ -129,30 +137,51 @@ class _StatusOverlay(QWidget):
         self._card.setObjectName("ov_card")
         self._card.setStyleSheet(
             "QFrame#ov_card {"
-            "  background: rgba(8, 8, 8, 200);"
+            "  background: rgba(8, 8, 8, 210);"
             "  border-radius: 10px;"
-            "  border: 1px solid rgba(255,255,255,14);"
+            "  border: 1px solid rgba(255,255,255,18);"
             "}"
             "QLabel { background: transparent; border: none; }"
         )
 
-        row = QHBoxLayout(self._card)
-        row.setContentsMargins(10, 7, 13, 7)
-        row.setSpacing(7)
+        card_lay = QVBoxLayout(self._card)
+        card_lay.setContentsMargins(12, 8, 14, 8)
+        card_lay.setSpacing(4)
+
+        # ── status row: dot + state text ──────────────────────────────────────
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(7)
 
         self._dot = QFrame()
         self._dot.setFixedSize(8, 8)
         self._dot.setStyleSheet(f"background:{T3}; border-radius:4px; border:none;")
 
-        from PyQt6.QtWidgets import QLabel as _QLabel
         self._lbl = _QLabel("Stopped")
         self._lbl.setStyleSheet(
             f"color:{T3}; font-size:12px; font-weight:700;"
             " font-family:'Segoe UI',sans-serif;"
         )
 
-        row.addWidget(self._dot)
-        row.addWidget(self._lbl)
+        status_row.addWidget(self._dot)
+        status_row.addWidget(self._lbl)
+        card_lay.addLayout(status_row)
+
+        # ── optional info labels (hidden by default) ──────────────────────────
+        _info_style = (
+            f"color:{T2}; font-size:10px;"
+            " font-family:'Segoe UI',sans-serif;"
+        )
+        self._loops_lbl   = _QLabel("")
+        self._rate_lbl    = _QLabel("")
+        self._runtime_lbl = _QLabel("")
+        for il in (self._loops_lbl, self._rate_lbl, self._runtime_lbl):
+            il.setStyleSheet(_info_style)
+            il.hide()
+        card_lay.addWidget(self._loops_lbl)
+        card_lay.addWidget(self._rate_lbl)
+        card_lay.addWidget(self._runtime_lbl)
+
         outer.addWidget(self._card)
         self.adjustSize()
 
@@ -167,6 +196,28 @@ class _StatusOverlay(QWidget):
         self._dot.setStyleSheet(
             f"background:{color}; border-radius:4px; border:none;"
         )
+        self.adjustSize()
+
+    def set_info(self, loops: int, rate: float, runtime: float, opts: dict):
+        """Show/hide and populate the optional info rows."""
+        if opts.get("show_loops", False):
+            self._loops_lbl.setText(f"{loops} loops")
+            self._loops_lbl.show()
+        else:
+            self._loops_lbl.hide()
+
+        if opts.get("show_rate", False):
+            self._rate_lbl.setText(f"{rate:.1f} / hr")
+            self._rate_lbl.show()
+        else:
+            self._rate_lbl.hide()
+
+        if opts.get("show_runtime", False):
+            self._runtime_lbl.setText(_fmt_time(runtime))
+            self._runtime_lbl.show()
+        else:
+            self._runtime_lbl.hide()
+
         self.adjustSize()
 
     # ── move mode ─────────────────────────────────────────────────────────────
@@ -186,6 +237,9 @@ class _StatusOverlay(QWidget):
             " font-family:'Segoe UI',sans-serif;"
         )
         self._dot.setStyleSheet("background:#60a5fa; border-radius:4px; border:none;")
+        # Hide info rows during move so the card is compact
+        for il in (self._loops_lbl, self._rate_lbl, self._runtime_lbl):
+            il.hide()
         self.adjustSize()
         self.show()
 
@@ -244,12 +298,14 @@ class Plugin(PluginBase):
     DESCRIPTION = "Automated fishing minigame bot for FiveM. Scans for colored targets, auto-clicks, and tracks session stats."
     ACCENT      = "#4ade80"
     TAGS        = ["FiveM", "Automation"]
-    VERSION     = "1.1.1"
+    VERSION     = "1.2.3"
 
     def __init__(self):
         self._bot_state      = State.IDLE
         self._catches        = 0
         self._loops          = 0
+        self._last_loop_time = 0.0
+        self._last_loop_s    = None   # duration of the most recent completed loop
         self._hk_gen         = 0
         self._active_overlay = None   # prevents GC of fullscreen overlays
         self._capturing      = {}     # hotkey name → bool
@@ -264,9 +320,12 @@ class Plugin(PluginBase):
         self._overlay = _StatusOverlay()
         _pos = _cfg.get("overlay_pos", default={"x": 20, "y": 60})
         self._overlay.move(_pos.get("x", 20), _pos.get("y", 60))
-        if _cfg.get("overlay_enabled", default=False):
-            self._overlay.show()
-        _bridge.update.connect(self._update_overlay)
+        # Don't show on init — _update_overlay will handle visibility
+        # Periodic timer keeps the overlay in sync (handles paused state,
+        # plugin-active gating, and live info rows without needing bridge events)
+        self._ov_timer = QTimer()
+        self._ov_timer.timeout.connect(self._update_overlay)
+        self._ov_timer.start(500)
 
         def _on_state(s):
             self._bot_state = s
@@ -276,6 +335,10 @@ class Plugin(PluginBase):
             if k == "catches":
                 self._catches = v
             elif k == "loops":
+                now = time.time()
+                if self._loops > 0 and self._last_loop_time > 0:
+                    self._last_loop_s = now - self._last_loop_time
+                self._last_loop_time = now
                 self._loops = v
             _bridge.update.emit()
 
@@ -285,6 +348,7 @@ class Plugin(PluginBase):
             on_stat_update=_on_stat,
             on_cooldown_tick=lambda e, t, l: _bridge.cooldown.emit(e, t, l),
             on_cycle_outcome=lambda o: _adaptive.record_cycle(o),
+            on_stop=lambda loops, rt: self._on_bot_stop(loops, rt),
         )
 
     # ── hub card status ───────────────────────────────────────────────────────
@@ -314,8 +378,8 @@ class Plugin(PluginBase):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _build_dashboard(self):
-        page = QWidget()
-        root = QVBoxLayout(page)
+        inner = QWidget()
+        root  = QVBoxLayout(inner)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
@@ -324,7 +388,6 @@ class Plugin(PluginBase):
                         align=Qt.AlignmentFlag.AlignCenter)
         root.addWidget(state_lbl)
         root.addSpacing(6)
-
 
         # ── cooldown bar (hidden when idle) ───────────────────────────────────
         cd_bar = QProgressBar()
@@ -357,26 +420,55 @@ class Plugin(PluginBase):
             return lay, val_w
 
         sr = QHBoxLayout(); sr.setSpacing(0); sr.addStretch()
-        lay, loops_lbl    = stat_pair("Loops");            sr.addLayout(lay); sr.addSpacing(28)
-        lay, rate_lbl     = stat_pair("Loops / hr");       sr.addLayout(lay); sr.addSpacing(28)
-        lay, runtime_lbl  = stat_pair("Runtime");          sr.addLayout(lay); sr.addSpacing(28)
-        lay, sessions_lbl = stat_pair("Sessions");         sr.addLayout(lay)
+        lay, loops_lbl    = stat_pair("Loops");       sr.addLayout(lay); sr.addSpacing(22)
+        lay, rate_lbl     = stat_pair("Loops / hr");  sr.addLayout(lay); sr.addSpacing(22)
+        lay, runtime_lbl  = stat_pair("Runtime");     sr.addLayout(lay); sr.addSpacing(22)
+        lay, sessions_lbl = stat_pair("Sessions");    sr.addLayout(lay); sr.addSpacing(22)
+        lay, lastloop_lbl = stat_pair("Last Loop");   sr.addLayout(lay)
         sr.addStretch()
         root.addLayout(sr)
-        root.addSpacing(12)
-        root.addWidget(sep())
+        root.addSpacing(10)
+
+        # ── session goal progress ─────────────────────────────────────────────
+        goal_frame = QWidget()
+        gf_lay = QVBoxLayout(goal_frame)
+        gf_lay.setContentsMargins(0, 4, 0, 2)
+        gf_lay.setSpacing(3)
+        goal_txt = lbl("", sz=10, col=T2, align=Qt.AlignmentFlag.AlignCenter)
+        gf_lay.addWidget(goal_txt)
+        goal_bar = QProgressBar()
+        goal_bar.setRange(0, 1000)
+        goal_bar.setTextVisible(False)
+        goal_bar.setFixedHeight(5)
+        goal_bar.setStyleSheet(
+            "QProgressBar { background:#1a1a1a; border:none; border-radius:2px; }"
+            "QProgressBar::chunk { background:#4ade80; border-radius:2px; }"
+        )
+        gf_lay.addWidget(goal_bar)
+        goal_frame.hide()
+        root.addWidget(goal_frame)
+
+        # ── auto-stop countdown ───────────────────────────────────────────────
+        as_lbl = lbl("", sz=10, col=AMBER, align=Qt.AlignmentFlag.AlignCenter)
+        as_lbl.hide()
+        root.addWidget(as_lbl)
         root.addSpacing(8)
 
-        # ── event log ─────────────────────────────────────────────────────────
-        log_w = QTextEdit()
-        log_w.setReadOnly(True)
-        log_w.setFixedHeight(80)
-        log_w.setStyleSheet(
-            "QTextEdit { background:#0f0f0f; border:1px solid #1e1e1e;"
-            " border-radius:6px; font-size:10px; color:#6b7280; padding:4px; }"
-        )
-        root.addWidget(log_w)
-        root.addSpacing(10)
+        root.addWidget(sep())
+        root.addSpacing(6)
+
+        # ── config summary ────────────────────────────────────────────────────
+        cfg_lbl = lbl("", sz=10, col=T3, align=Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(cfg_lbl)
+        root.addSpacing(4)
+
+        # ── last adaptive adjustment ──────────────────────────────────────────
+        adapt_lbl = lbl("", sz=10, col=T3, align=Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(adapt_lbl)
+        root.addSpacing(8)
+
+        root.addWidget(sep())
+        root.addSpacing(8)
 
         # ── hotkey quick-reference strip ──────────────────────────────────────
         _HK_REF = [
@@ -413,6 +505,7 @@ class Plugin(PluginBase):
         cr_row.addWidget(colors_info)
         cr_row.addStretch()
         root.addLayout(cr_row)
+        root.addStretch()
 
         # ── refresh callbacks ─────────────────────────────────────────────────
 
@@ -422,12 +515,12 @@ class Plugin(PluginBase):
                     if n else "No colors set — configure in Settings")
 
         def refresh():
-            running         = self._engine.is_running
-            manual_paused   = self._engine.is_paused
-            fivem_ok        = is_fivem_focused()
-            auto_pause_on   = _cfg.get("auto_pause_unfocused", default=True)
-            unfocus_paused  = auto_pause_on and not fivem_ok
-            any_paused      = manual_paused or unfocus_paused
+            running        = self._engine.is_running
+            manual_paused  = self._engine.is_paused
+            fivem_ok       = is_fivem_focused()
+            auto_pause_on  = _cfg.get("auto_pause_unfocused", default=True)
+            unfocus_paused = auto_pause_on and not fivem_ok
+            any_paused     = manual_paused or unfocus_paused
 
             if running and any_paused:
                 if manual_paused:
@@ -442,8 +535,6 @@ class Plugin(PluginBase):
                 state_lbl.setText(text)
                 state_lbl.setStyleSheet(
                     f"color:{color}; font-size:22px; font-weight:700; background:transparent;")
-                # Hide bar only for states that don't use timed_sleep
-                # (WAIT_START and WAIT_END both drive the progress bar)
                 if self._bot_state not in (State.WAIT_START, State.WAIT_END):
                     cd_bar.hide(); cd_lbl.hide()
             else:
@@ -461,6 +552,65 @@ class Plugin(PluginBase):
             sessions_lbl.setText(str(_cfg.get("stats", "lifetime_sessions", default=0)))
             colors_info.setText(_colors_text())
 
+            # Last Loop
+            lastloop_lbl.setText(
+                f"{self._last_loop_s:.1f}s" if self._last_loop_s is not None else "—"
+            )
+
+            # Session Goal progress
+            goal = _cfg.get("session_goal", default=0)
+            if goal > 0:
+                done      = self._loops >= goal
+                pct       = min(int(self._loops / goal * 1000), 1000)
+                chunk_col = "#fbbf24" if done else "#4ade80"
+                goal_bar.setValue(pct)
+                goal_txt.setText(
+                    f"Goal: {self._loops} / {goal} loops" + ("  ✓" if done else "")
+                )
+                goal_bar.setStyleSheet(
+                    "QProgressBar{background:#1a1a1a;border:none;border-radius:2px;}"
+                    f"QProgressBar::chunk{{background:{chunk_col};border-radius:2px;}}"
+                )
+                goal_frame.show()
+            else:
+                goal_frame.hide()
+
+            # Auto-stop countdown
+            as_loops = _cfg.get("auto_stop", "loops",   default=0)
+            as_mins  = _cfg.get("auto_stop", "minutes", default=0)
+            if as_loops > 0 or as_mins > 0:
+                parts = []
+                if as_loops > 0:
+                    rem = max(0, as_loops - self._loops)
+                    parts.append(f"{rem} loop{'s' if rem != 1 else ''} left")
+                if as_mins > 0 and running:
+                    rem_s = max(0.0, as_mins * 60 - rt)
+                    m, s  = divmod(int(rem_s), 60)
+                    parts.append(f"{m}:{s:02d} left")
+                elif as_mins > 0:
+                    parts.append(f"{as_mins} min limit")
+                as_lbl.setText("Auto-stop:  " + "  ·  ".join(parts))
+                as_lbl.show()
+            else:
+                as_lbl.hide()
+
+            # Config summary
+            preset_key  = _cfg.get("level_preset", default="1-4")
+            preset_name = LEVEL_PRESETS.get(preset_key, LEVEL_PRESETS["1-4"])["label"]
+            icon_n      = _cfg.get_icon_count()
+            sw          = _cfg.get("timing", "start_wait",       default=1.75)
+            aw          = _cfg.get("timing", "after_click_wait", default=2.80)
+            cfg_lbl.setText(
+                f"{preset_name}  ·  {icon_n} icon{'s' if icon_n != 1 else ''}"
+                f"  ·  Cast {sw:.2f}s  ·  After {aw:.2f}s"
+            )
+
+            # Last adaptive adjustment
+            alog = _adaptive.get_log()
+            adapt_lbl.setText(
+                f"{alog[0]['time']}  {alog[0]['title']}" if alog else ""
+            )
+
             for hk_name, chip in hk_chips.items():
                 k, _ = _cfg.get_hotkey(hk_name)
                 chip.setText((k or "—").upper())
@@ -471,28 +621,22 @@ class Plugin(PluginBase):
             cd_lbl.setText(label)
             cd_bar.show(); cd_lbl.show()
 
-        def _on_log(msg):
-            log_w.append(msg)
-            sb = log_w.verticalScrollBar()
-            sb.setValue(sb.maximum())
-
-        # Debounce bridge updates — rapid state-change bursts fire _bridge.update
-        # many times in quick succession; coalesce them into one repaint after 80ms
-        _debounce = QTimer(page)
+        # Debounce bridge updates
+        _debounce = QTimer(inner)
         _debounce.setSingleShot(True)
         _debounce.setInterval(80)
         _debounce.timeout.connect(refresh)
         _bridge.update.connect(lambda: _debounce.start())
 
         _bridge.cooldown.connect(_on_cd)
-        _bridge.log_msg.connect(_on_log)
 
-        # Slower poll for live counters (runtime, catch rate) that update continuously
-        timer = QTimer(page)
+        # Main poll — live counters
+        timer = QTimer(inner)
         timer.timeout.connect(refresh)
         timer.start(500)
+
         refresh()
-        return page
+        return inner
 
     # ══════════════════════════════════════════════════════════════════════════
     # Settings tab
@@ -796,6 +940,99 @@ class Plugin(PluginBase):
         ov_row.addSpacing(4)
         ov_row.addWidget(ov_sw)
         root.addLayout(ov_row)
+        root.addSpacing(12)
+
+        # ── Overlay display options ────────────────────────────────────────────
+        root.addWidget(lbl("Display on overlay", sz=10, col=T3))
+        root.addSpacing(8)
+
+        _ov_opts = _cfg.get("overlay_opts", default={})
+        for opt_key, opt_label in [
+            ("show_loops",   "Loop count"),
+            ("show_rate",    "Loops / hr"),
+            ("show_runtime", "Runtime"),
+        ]:
+            sw = ToggleSwitch(_ov_opts.get(opt_key, False))
+            def _on_opt(v, k=opt_key):
+                cur = dict(_cfg.get("overlay_opts", default={}))
+                cur[k] = v
+                _cfg.set("overlay_opts", cur)
+                self._update_overlay()
+            sw.toggled.connect(_on_opt)
+            opt_row = QHBoxLayout()
+            opt_row.setContentsMargins(12, 0, 0, 0)
+            opt_row.addWidget(lbl(opt_label, sz=12, col=T2))
+            opt_row.addStretch()
+            opt_row.addWidget(sw)
+            root.addLayout(opt_row)
+            root.addSpacing(6)
+
+        root.addSpacing(12)
+        root.addWidget(sep())
+        root.addSpacing(16)
+
+        # ── Session Goal ──────────────────────────────────────────────────────
+        root.addWidget(section_header("Session Goal"))
+        root.addSpacing(8)
+
+        sg_st = NumericStepper(
+            _cfg.get("session_goal", default=0),
+            step=10, min_val=0, max_val=9999, fmt="{:.0f}",
+        )
+        sg_st.changed.connect(lambda v: _cfg.set("session_goal", int(v)))
+        root.addLayout(_hrow(lbl("Loops target  (0 = off)", sz=12, col=T2), sg_st))
+        root.addSpacing(12)
+        root.addWidget(sep())
+        root.addSpacing(16)
+
+        # ── Discord ───────────────────────────────────────────────────────────
+        root.addWidget(section_header("Discord"))
+        root.addSpacing(8)
+
+        root.addWidget(lbl("Webhook URL", sz=12, col=T2))
+        root.addSpacing(4)
+        wh_edit = QLineEdit()
+        wh_edit.setPlaceholderText("https://discord.com/api/webhooks/…")
+        wh_edit.setText(_cfg.get("discord_webhook_url", default=""))
+        wh_edit.editingFinished.connect(
+            lambda: _cfg.set("discord_webhook_url", wh_edit.text().strip())
+        )
+        root.addWidget(wh_edit)
+        root.addSpacing(12)
+
+        root.addWidget(lbl("Milestones  (loop counts, comma-separated)", sz=12, col=T2))
+        root.addSpacing(4)
+        ms_edit = QLineEdit()
+        ms_edit.setPlaceholderText("e.g. 10, 25, 50, 100, 250")
+        _cur_ms = _cfg.get("discord_milestones", default=[10, 25, 50, 100, 250])
+        ms_edit.setText(", ".join(str(x) for x in _cur_ms))
+
+        def _save_milestones():
+            raw = ms_edit.text()
+            try:
+                vals = sorted(set(
+                    int(x.strip()) for x in raw.split(",")
+                    if x.strip().isdigit() and int(x.strip()) > 0
+                ))
+                if vals:
+                    _cfg.set("discord_milestones", vals)
+                    ms_edit.setText(", ".join(str(x) for x in vals))
+            except Exception:
+                pass
+
+        ms_edit.editingFinished.connect(_save_milestones)
+        root.addWidget(ms_edit)
+        root.addSpacing(12)
+
+        ns_sw = ToggleSwitch(_cfg.get("discord_notify_stop", default=False))
+        ns_sw.toggled.connect(lambda v: _cfg.set("discord_notify_stop", v))
+        root.addLayout(_hrow(lbl("Notify on stop", sz=12, col=T2), ns_sw))
+        root.addSpacing(4)
+        root.addWidget(lbl(
+            "Sends a session summary (loops, runtime, loops/hr) to your webhook "
+            "each time the bot stops.",
+            sz=10, col=T3, wrap=True,
+        ))
 
         root.addStretch()
         return scrollable(inner)
@@ -822,9 +1059,10 @@ class Plugin(PluginBase):
             return lay, val_w
 
         sr = QHBoxLayout(); sr.setSpacing(0); sr.addStretch()
-        lay, lc_lbl = stat_col("Catches");  sr.addLayout(lay); sr.addSpacing(36)
-        lay, ls_lbl = stat_col("Sessions"); sr.addLayout(lay); sr.addSpacing(36)
-        lay, lr_lbl = stat_col("Runtime");  sr.addLayout(lay)
+        lay, lc_lbl  = stat_col("Loops");    sr.addLayout(lay); sr.addSpacing(36)
+        lay, ls_lbl  = stat_col("Sessions"); sr.addLayout(lay); sr.addSpacing(36)
+        lay, lr_lbl  = stat_col("Runtime");  sr.addLayout(lay); sr.addSpacing(36)
+        lay, lavg_lbl = stat_col("Avg / hr"); sr.addLayout(lay)
         sr.addStretch()
         root.addLayout(sr)
         root.addSpacing(10)
@@ -851,10 +1089,11 @@ class Plugin(PluginBase):
             return lay, val_w
 
         ar = QHBoxLayout(); ar.setSpacing(0); ar.addStretch()
-        lay, sr_lbl   = adapt_col("Success Rate"); ar.addLayout(lay); ar.addSpacing(28)
-        lay, cyc_lbl  = adapt_col("Cycles");       ar.addLayout(lay); ar.addSpacing(28)
-        lay, det_lbl  = adapt_col("Avg Detected"); ar.addLayout(lay); ar.addSpacing(28)
-        lay, ttfd_lbl = adapt_col("Avg TTFD (s)"); ar.addLayout(lay)
+        lay, sr_lbl   = adapt_col("Success Rate"); ar.addLayout(lay); ar.addSpacing(24)
+        lay, cyc_lbl  = adapt_col("Cycles");       ar.addLayout(lay); ar.addSpacing(24)
+        lay, det_lbl  = adapt_col("Avg Detected"); ar.addLayout(lay); ar.addSpacing(24)
+        lay, ttfd_lbl = adapt_col("Avg TTFD (s)"); ar.addLayout(lay); ar.addSpacing(24)
+        lay, rec_lbl  = adapt_col("Recovery %");   ar.addLayout(lay)
         ar.addStretch()
         root.addLayout(ar)
         root.addSpacing(16)
@@ -944,15 +1183,20 @@ class Plugin(PluginBase):
         # ── refresh ────────────────────────────────────────────────────────────
 
         def _refresh_stats():
-            lc_lbl.setText(str(_cfg.get("stats", "lifetime_catches",   default=0)))
-            ls_lbl.setText(str(_cfg.get("stats", "lifetime_sessions",  default=0)))
-            lr_lbl.setText(_fmt_time(_cfg.get("stats", "lifetime_runtime_s", default=0)))
+            ll_loops   = _cfg.get("stats", "lifetime_loops",      default=0)
+            ll_runtime = _cfg.get("stats", "lifetime_runtime_s",  default=0)
+            lc_lbl.setText(str(ll_loops))
+            ls_lbl.setText(str(_cfg.get("stats", "lifetime_sessions", default=0)))
+            lr_lbl.setText(_fmt_time(ll_runtime))
+            avg_hr = (ll_loops / (ll_runtime / 3600)) if ll_runtime > 0 else 0.0
+            lavg_lbl.setText(f"{avg_hr:.1f}")
 
             stats = _adaptive.get_stats()
             sr_lbl.setText(f"{stats['success_rate']:.0%}")
             cyc_lbl.setText(str(_adaptive.total_cycles))
             det_lbl.setText(str(stats["avg_detected"]))
             ttfd_lbl.setText(f"{stats['avg_ttfd']:.2f}")
+            rec_lbl.setText(f"{stats['recovery_rate']:.0%}")
 
             adj_log.clear()
             for entry in reversed(_adaptive.get_log()):
@@ -977,6 +1221,7 @@ class Plugin(PluginBase):
 
         def _reset_stats():
             _cfg.set("stats", "lifetime_catches",   0)
+            _cfg.set("stats", "lifetime_loops",     0)
             _cfg.set("stats", "lifetime_sessions",  0)
             _cfg.set("stats", "lifetime_runtime_s", 0)
             _refresh_stats()
@@ -1034,7 +1279,7 @@ class Plugin(PluginBase):
             sw = ToggleSwitch(enabled)
             def _on_enabled(v, n=name):
                 _cfg.set_hotkey(n, enabled=v)
-                if n == "toggle_bot":
+                if n in ("toggle_bot", "pause_bot"):
                     self._start_poll()
                 else:
                     self._start_hk_listener()
@@ -1048,29 +1293,42 @@ class Plugin(PluginBase):
         root.addStretch()
         return page
 
-    # ── hotkey poll (toggle bot) ──────────────────────────────────────────────
+    # ── hotkey poll (toggle + pause — win32api, works while FiveM focused) ──────
 
     def _start_poll(self):
         self._hk_gen += 1
         my_gen = self._hk_gen
-        hk_str, enabled = _cfg.get_hotkey("toggle_bot")
-        vk = _vk(hk_str)
-        if not vk or not enabled:
+
+        toggle_str, toggle_en = _cfg.get_hotkey("toggle_bot")
+        toggle_vk = _vk(toggle_str) if toggle_en else 0
+
+        pause_str, pause_en = _cfg.get_hotkey("pause_bot")
+        pause_vk = _vk(pause_str) if pause_en else 0
+
+        if not toggle_vk and not pause_vk:
             return
 
         def poll():
-            last = False
+            last_toggle = False
+            last_pause  = False
             time.sleep(0.06)
             while self._hk_gen == my_gen:
                 try:
-                    down = bool(win32api.GetAsyncKeyState(vk) & 0x8000)
-                    if down and not last and is_plugin_active("Magnet Bot"):
-                        if self._engine.is_running:
-                            self._engine.stop()
-                        else:
-                            self._engine.start()
-                        _bridge.update.emit()
-                    last = down
+                    if toggle_vk:
+                        down = bool(win32api.GetAsyncKeyState(toggle_vk) & 0x8000)
+                        if down and not last_toggle and is_plugin_active("Magnet Bot"):
+                            if self._engine.is_running:
+                                self._engine.stop()
+                            else:
+                                self._engine.start()
+                            _bridge.update.emit()
+                        last_toggle = down
+
+                    if pause_vk:
+                        down = bool(win32api.GetAsyncKeyState(pause_vk) & 0x8000)
+                        if down and not last_pause and is_plugin_active("Magnet Bot"):
+                            _bridge.hk_pause.emit()
+                        last_pause = down
                 except Exception:
                     pass
                 time.sleep(0.05)
@@ -1096,7 +1354,6 @@ class Plugin(PluginBase):
         str_to_sig: dict = {}
         for hk_id, sig in [
             ("emergency_stop",      _bridge.hk_emergency),
-            ("pause_bot",           _bridge.hk_pause),
             ("select_wait_point",   _bridge.hk_wait_point),
             ("select_catch_region", _bridge.hk_catch_region),
             ("open_color_picker",   _bridge.hk_color_picker),
@@ -1182,6 +1439,39 @@ class Plugin(PluginBase):
                     self._rebuild_swatches()
         self._active_overlay = ColorPickerOverlay(None, on_pick)
 
+    # ── Discord stop notification ─────────────────────────────────────────────
+
+    def _on_bot_stop(self, loops: int, runtime: float):
+        """
+        Called by BotEngine when a session ends (via on_stop callback).
+        Posts a session summary to the Discord webhook if the toggle is on.
+        Runs the HTTP request in a daemon thread so it never blocks the UI.
+        """
+        url = _cfg.get("discord_webhook_url", default="")
+        if not url or not _cfg.get("discord_notify_stop", default=False):
+            return
+
+        def _post():
+            try:
+                h, rem = divmod(int(runtime), 3600)
+                m, s   = divmod(rem, 60)
+                rt_str = f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
+                rate   = (loops / (runtime / 3600)) if runtime > 0 else 0.0
+                content = (
+                    f"🎣 **Magnet Bot** — Session ended\n"
+                    f"> **{loops}** loops  ·  {rt_str} runtime  ·  {rate:.1f} loops/hr"
+                )
+                data = _json.dumps({"content": content}).encode()
+                req  = urllib.request.Request(
+                    url, data=data,
+                    headers={"Content-Type": "application/json"},
+                )
+                urllib.request.urlopen(req, timeout=8)
+            except Exception:
+                pass
+
+        threading.Thread(target=_post, daemon=True).start()
+
     # ── interaction key capture ───────────────────────────────────────────────
 
     def _start_ik_capture(self):
@@ -1224,6 +1514,15 @@ class Plugin(PluginBase):
         if self._capturing.get(name):
             return
         self._capturing[name] = True
+
+        # Stop the persistent pynput listener before capture — on Windows,
+        # two simultaneous WH_KEYBOARD_LL hooks from the same process compete
+        # and the capture listener may never see the key press.
+        if self._hk_listener is not None:
+            try: self._hk_listener.stop()
+            except Exception: pass
+            self._hk_listener = None
+
         badge = self._badges.get(name)
         if badge:
             badge.setText("…")
@@ -1245,10 +1544,11 @@ class Plugin(PluginBase):
                         badge.setProperty("capturing", False)
                         badge.style().unpolish(badge); badge.style().polish(badge)
                     self._capturing[name] = False
-                    if name == "toggle_bot":
+                    # Always restart the persistent listener (was stopped before capture)
+                    # and the poll for the two win32api-based keys
+                    if name in ("toggle_bot", "pause_bot"):
                         self._start_poll()
-                    else:
-                        self._start_hk_listener()
+                    self._start_hk_listener()
 
                 QTimer.singleShot(0, apply)
                 return False
@@ -1263,18 +1563,41 @@ class Plugin(PluginBase):
     # ── overlay state sync ────────────────────────────────────────────────────
 
     def _update_overlay(self):
-        ov = self._overlay
-        if not ov.isVisible() or ov._move_mode:
+        ov      = self._overlay
+        enabled = _cfg.get("overlay_enabled", default=False)
+
+        # Hide when disabled or a different plugin is active
+        if not enabled or not is_plugin_active("Magnet Bot"):
+            if not ov._move_mode:
+                ov.hide()
             return
-        running = self._engine.is_running
-        paused  = self._engine.is_paused or not is_fivem_focused()
-        if running and paused:
+
+        # Ensure visible (may have been hidden when navigating away)
+        if not ov._move_mode:
+            if not ov.isVisible():
+                ov.show()
+        else:
+            return   # move mode handles its own display
+
+        running       = self._engine.is_running
+        manual_paused = self._engine.is_paused
+        auto_pause_on = _cfg.get("auto_pause_unfocused", default=True)
+        any_paused    = manual_paused or (auto_pause_on and not is_fivem_focused())
+
+        if running and any_paused:
             ov.set_state("Paused", AMBER)
         elif running:
             text, color = _OV_TEXT.get(self._bot_state, ("Running", GREEN))
             ov.set_state(text, color)
         else:
             ov.set_state("Stopped", T3)
+
+        # Update optional info rows
+        opts    = _cfg.get("overlay_opts", default={})
+        loops   = self._loops
+        rate    = self._engine.get_loop_rate()        if running else 0.0
+        runtime = self._engine.get_session_runtime() if running else 0.0
+        ov.set_info(loops, rate, runtime, opts)
 
     def on_unload(self):
         """Stop all background threads before plugin is destroyed on hot-reload."""
@@ -1295,9 +1618,9 @@ class Plugin(PluginBase):
         # Kill the toggle-bot poll thread by advancing the generation counter
         self._hk_gen += 1
 
-        # Disconnect overlay update signal and destroy the overlay window
+        # Stop the overlay refresh timer and destroy the overlay window
         try:
-            _bridge.update.disconnect(self._update_overlay)
+            self._ov_timer.stop()
         except Exception:
             pass
         try:

@@ -129,7 +129,7 @@ class Plugin(PluginBase):
     DESCRIPTION = "Spams E → W → A on repeat. Auto-pauses the moment FiveM loses window focus."
     ACCENT      = "#60a5fa"
     TAGS        = ["FiveM", "Input"]
-    VERSION     = "1.1.1"
+    VERSION     = "1.2.3"
 
     def __init__(self):
         self._hk_gen    = 0

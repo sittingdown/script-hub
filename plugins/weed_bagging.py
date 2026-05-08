@@ -136,7 +136,7 @@ class Plugin(PluginBase):
     DESCRIPTION = "Spams a key sequence for the weed bagging job. Auto-pauses when FiveM loses focus."
     ACCENT      = "#fbbf24"
     TAGS        = ["FiveM", "Job"]
-    VERSION     = "1.1.1"
+    VERSION     = "1.2.3"
 
     def __init__(self):
         self._hk_gen    = 0
