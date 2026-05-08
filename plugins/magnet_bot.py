@@ -49,7 +49,6 @@ class _Bridge(QObject):
     hk_catch_region  = pyqtSignal()
     hk_color_picker  = pyqtSignal()
     hk_emergency     = pyqtSignal()
-    hk_pause         = pyqtSignal()
 
 _bridge = _Bridge()
 
@@ -59,7 +58,6 @@ _bridge.hk_wait_point.connect(  lambda: _plugin_ref[0] and _plugin_ref[0]._do_se
 _bridge.hk_catch_region.connect(lambda: _plugin_ref[0] and _plugin_ref[0]._do_select_catch_region())
 _bridge.hk_color_picker.connect(lambda: _plugin_ref[0] and _plugin_ref[0]._do_open_color_picker())
 _bridge.hk_emergency.connect(   lambda: _plugin_ref[0] and _plugin_ref[0]._do_emergency_stop())
-_bridge.hk_pause.connect(       lambda: _plugin_ref[0] and _plugin_ref[0]._do_pause())
 
 # ── adaptive engine ───────────────────────────────────────────────────────────
 _adaptive = AdaptiveEngine(
@@ -808,11 +806,12 @@ class Plugin(PluginBase):
 
         td = _cfg.get("timing", default={})
         timing_rows = [
-            ("Cast Wait (s)",        "start_wait",         td.get("start_wait",         1.75), 0.05, 0.1,  30.0),
-            ("After Click Wait (s)", "after_click_wait",   td.get("after_click_wait",   2.80), 0.05, 0.1,  30.0),
-            ("Scan Interval (s)",    "scan_interval",      td.get("scan_interval",      0.05), 0.01, 0.01,  1.0),
-            ("Click Delay (s)",      "click_delay",        td.get("click_delay",        0.12), 0.01, 0.01,  2.0),
-            ("Min Cluster Pixels",   "min_cluster_pixels", td.get("min_cluster_pixels", 15),   1,    1,    500),
+            ("Cast Wait (s)",           "start_wait",          td.get("start_wait",          1.75), 0.05, 0.1,  30.0),
+            ("After Click Wait (s)",    "after_click_wait",    td.get("after_click_wait",    2.80), 0.05, 0.1,  30.0),
+            ("Between Cycle Delay (s)", "between_cycle_delay", td.get("between_cycle_delay", 0.50), 0.05, 0.0,   5.0),
+            ("Scan Interval (s)",       "scan_interval",       td.get("scan_interval",       0.05), 0.01, 0.01,  1.0),
+            ("Click Delay (s)",         "click_delay",         td.get("click_delay",         0.12), 0.01, 0.01,  2.0),
+            ("Min Cluster Pixels",      "min_cluster_pixels",  td.get("min_cluster_pixels",  15),   1,    1,    500),
         ]
         _preset_steppers: dict = {}   # tkey → NumericStepper; used by preset buttons
         for tname, tkey, tval, tstep, tmin, tmax in timing_rows:
@@ -1327,7 +1326,9 @@ class Plugin(PluginBase):
                     if pause_vk:
                         down = bool(win32api.GetAsyncKeyState(pause_vk) & 0x8000)
                         if down and not last_pause and is_plugin_active("Magnet Bot"):
-                            _bridge.hk_pause.emit()
+                            if self._engine.is_running:
+                                self._engine.toggle_pause()
+                                _bridge.update.emit()
                         last_pause = down
                 except Exception:
                     pass
@@ -1393,13 +1394,6 @@ class Plugin(PluginBase):
         self._hk_listener.start()
 
     # ── setup hotkey actions ──────────────────────────────────────────────────
-
-    def _do_pause(self):
-        """Toggle manual pause on the bot engine."""
-        if not self._engine.is_running:
-            return
-        self._engine.toggle_pause()
-        _bridge.update.emit()
 
     def _do_emergency_stop(self):
         self._engine.stop()
