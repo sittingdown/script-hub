@@ -36,8 +36,17 @@ from hub_sdk import (
 from overlays_qt import (
     RegionSelectorOverlay, PointSelectorOverlay, ColorPickerOverlay,
 )
-from detector import capture_region, build_color_mask, find_clusters
+from detector import capture_region, build_color_mask
 from bot import is_fivem_focused
+import numpy as np
+
+# Optional scipy fast-path for pixel-level connected components.
+# Falls back to a pure-numpy BFS if scipy isn't available.
+try:
+    from scipy.ndimage import label as _ndi_label   # type: ignore
+    _HAS_SCIPY_LABEL = True
+except Exception:
+    _HAS_SCIPY_LABEL = False
 
 # ── config ────────────────────────────────────────────────────────────────────
 
@@ -68,6 +77,17 @@ _DEF = {
     "max_round_wait":    12.0,
 
     "auto_pause_unfocused": True,
+
+    "stats": {
+        "lifetime_rounds":    0,
+        "lifetime_aborts":    0,
+        "lifetime_clicks":    0,
+        "lifetime_sessions":  0,
+        "lifetime_runtime_s": 0.0,
+        "best_rate_per_hr":   0.0,
+        "fastest_round_s":    0.0,
+        "session_history":    [],   # newest at the end, capped to 50
+    },
 
     "overlay_enabled": False,
     "overlay_pos":     {"x": 20, "y": 60},
@@ -165,6 +185,63 @@ def _move_to(x: int, y: int):
     except Exception:
         pass
 
+# ── pixel-level connected components ──────────────────────────────────────────
+
+def _find_components(mask, min_pixels: int):
+    """
+    True 4-connected components on a boolean mask. Returns [(cx, cy), ...]
+    centroids in mask coords. Strictly better separation than the cell-grid
+    flood-fill in detector.py — close-but-not-touching icons stay distinct.
+    Uses scipy.ndimage.label when available for a C-speed pass; otherwise
+    falls back to a pure-Python BFS that's still fast enough for typical
+    region sizes (~5–10 ms per scan).
+    """
+    if not mask.any():
+        return []
+    h, w = mask.shape
+
+    # Fast path — scipy connected components + bincount centroids
+    if _HAS_SCIPY_LABEL:
+        labels, n = _ndi_label(mask)
+        if n == 0:
+            return []
+        flat = labels.ravel()
+        ys, xs = np.indices((h, w), dtype=np.int32)
+        counts = np.bincount(flat, minlength=n + 1)
+        ysum   = np.bincount(flat, weights=ys.ravel(), minlength=n + 1)
+        xsum   = np.bincount(flat, weights=xs.ravel(), minlength=n + 1)
+        centers = []
+        for lid in range(1, n + 1):
+            c = int(counts[lid])
+            if c >= min_pixels:
+                centers.append((int(xsum[lid] / c), int(ysum[lid] / c)))
+        return centers
+
+    # Fallback — pure Python BFS, iterating only over True pixels
+    visited = np.zeros((h, w), dtype=bool)
+    centers = []
+    ys_idx, xs_idx = np.where(mask)
+    for sy, sx in zip(ys_idx.tolist(), xs_idx.tolist()):
+        if visited[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        cy_sum = 0; cx_sum = 0; n = 0
+        while stack:
+            y, x = stack.pop()
+            if y < 0 or y >= h or x < 0 or x >= w:
+                continue
+            if visited[y, x] or not mask[y, x]:
+                continue
+            visited[y, x] = True
+            cy_sum += y; cx_sum += x; n += 1
+            stack.append((y - 1, x))
+            stack.append((y + 1, x))
+            stack.append((y, x - 1))
+            stack.append((y, x + 1))
+        if n >= min_pixels:
+            centers.append((cx_sum // n, cy_sum // n))
+    return centers
+
 # ── bridge: worker → Qt main thread ───────────────────────────────────────────
 
 class _Bridge(QObject):
@@ -189,9 +266,13 @@ class _State:
     clicks_round  = 0
     rounds_done   = 0
     last_clusters = 0
-    session_start = None       # monotonic seconds, or None when stopped
-    last_round_s  = None       # seconds the last round took
-    round_start   = None       # monotonic seconds, current round start
+    session_start       = None    # monotonic seconds, or None when stopped
+    session_started_at  = None    # wall-clock unix time at session start
+    session_aborts      = 0       # rounds aborted in this session
+    session_clicks      = 0       # total icon clicks in this session
+    fastest_round_s     = None    # fastest single round in this session
+    last_round_s        = None    # seconds the last round took
+    round_start         = None    # monotonic seconds, current round start
 
 state = _State()
 
@@ -320,7 +401,7 @@ class _Worker:
                     now = time.monotonic()
                     img = capture_region(region)
                     mask = build_color_mask(img, colors, tolerance)
-                    centers = find_clusters(mask, min_pixels=min_px)
+                    centers = _find_components(mask, min_px)
                     state.last_clusters = len(centers)
 
                     if centers:
@@ -335,7 +416,8 @@ class _Worker:
                             if self._is_new_target(ax, ay, dedupe_r):
                                 _click_at(ax, ay, hold=click_h)
                                 self._clicked.append((ax, ay))
-                                state.clicks_round += 1
+                                state.clicks_round  += 1
+                                state.session_clicks += 1
                                 _bridge.update.emit()
                                 # park cursor between clicks so it doesn't
                                 # cover the next icon's colour pixels
@@ -357,7 +439,13 @@ class _Worker:
                 if not aborted:
                     state.rounds_done += 1
                     if state.round_start is not None:
-                        state.last_round_s = time.monotonic() - state.round_start
+                        dur = time.monotonic() - state.round_start
+                        state.last_round_s = dur
+                        if (state.fastest_round_s is None
+                                or dur < state.fastest_round_s):
+                            state.fastest_round_s = dur
+                else:
+                    state.session_aborts += 1
                 self.reset_round()
                 state.phase = "COOLDOWN"
                 _bridge.update.emit()
@@ -641,9 +729,10 @@ class Plugin(PluginBase):
     # ── build_page ────────────────────────────────────────────────────────────
 
     def build_page(self, nav_back):
-        container, stack = make_tabs(["Dashboard", "Settings", "Hotkeys"])
+        container, stack = make_tabs(["Dashboard", "Settings", "Stats", "Hotkeys"])
         stack.addWidget(self._build_dashboard())
         stack.addWidget(scrollable(self._build_settings()))
+        stack.addWidget(scrollable(self._build_stats()))
         stack.addWidget(scrollable(self._build_hotkeys()))
         # focus tick
         t = QTimer(container)
@@ -1115,6 +1204,252 @@ class Plugin(PluginBase):
             pass
 
     # ══════════════════════════════════════════════════════════════════════════
+    # Stats tab — lifetime totals, last session, session history
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_stats(self):
+        inner = QWidget()
+        root = QVBoxLayout(inner)
+        root.setContentsMargins(0, 8, 0, 8)
+        root.setSpacing(0)
+
+        self._stats_widgets: dict = {}   # field name → QLabel
+
+        def stat_col(caption, font_sz=18):
+            lay = QVBoxLayout(); lay.setSpacing(2)
+            cap_w = lbl(caption, sz=10, col=T3,
+                        align=Qt.AlignmentFlag.AlignCenter)
+            val_w = lbl("—", sz=font_sz, col=T1, bold=True,
+                        align=Qt.AlignmentFlag.AlignCenter)
+            lay.addWidget(cap_w); lay.addWidget(val_w)
+            return lay, val_w
+
+        def kv_row(label_text, key):
+            row = QHBoxLayout(); row.setSpacing(0)
+            row.addWidget(lbl(label_text, sz=12, col=T2))
+            row.addStretch()
+            v = lbl("—", sz=12, col=T1, bold=True)
+            self._stats_widgets[key] = v
+            row.addWidget(v)
+            root.addLayout(row)
+            root.addSpacing(4)
+
+        # ── LIFETIME ─────────────────────────────────────────────────────────
+        root.addWidget(section_header("Lifetime"))
+        root.addSpacing(12)
+
+        sr1 = QHBoxLayout(); sr1.setSpacing(0); sr1.addStretch()
+        for caption, key in (("Rounds",   "lt_rounds"),
+                             ("Clicks",   "lt_clicks"),
+                             ("Sessions", "lt_sessions"),
+                             ("Runtime",  "lt_runtime")):
+            lay, w = stat_col(caption)
+            self._stats_widgets[key] = w
+            sr1.addLayout(lay); sr1.addSpacing(28)
+        sr1.addStretch()
+        root.addLayout(sr1)
+        root.addSpacing(14)
+
+        sr2 = QHBoxLayout(); sr2.setSpacing(0); sr2.addStretch()
+        for caption, key in (("Avg Rate / hr", "lt_rate"),
+                             ("Avg / Round",   "lt_avg_per_round"),
+                             ("Best Rate",     "lt_best_rate"),
+                             ("Fastest Round", "lt_fastest")):
+            lay, w = stat_col(caption, font_sz=16)
+            self._stats_widgets[key] = w
+            sr2.addLayout(lay); sr2.addSpacing(28)
+        sr2.addStretch()
+        root.addLayout(sr2)
+        root.addSpacing(14)
+
+        # success rate (centred, large)
+        sr3 = QHBoxLayout(); sr3.addStretch()
+        lay, w = stat_col("Success Rate", font_sz=22)
+        self._stats_widgets["lt_success"] = w
+        sr3.addLayout(lay); sr3.addStretch()
+        root.addLayout(sr3)
+        root.addSpacing(12)
+
+        rst_btn = QPushButton("Reset Lifetime Stats")
+        rst_btn.setObjectName("badge")
+        rst_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        rst_btn.setFixedWidth(180)
+        rst_row = QHBoxLayout(); rst_row.addStretch(); rst_row.addWidget(rst_btn)
+        root.addLayout(rst_row)
+        root.addSpacing(16)
+        root.addWidget(sep())
+        root.addSpacing(14)
+
+        # ── LAST SESSION ─────────────────────────────────────────────────────
+        root.addWidget(section_header("Last Session"))
+        root.addSpacing(8)
+
+        kv_row("Date",          "ls_date")
+        kv_row("Rounds",        "ls_rounds")
+        kv_row("Aborts",        "ls_aborts")
+        kv_row("Clicks",        "ls_clicks")
+        kv_row("Runtime",       "ls_runtime")
+        kv_row("Rate / hr",     "ls_rate")
+        kv_row("Fastest Round", "ls_fastest")
+        kv_row("Success Rate",  "ls_success")
+
+        root.addSpacing(14)
+        root.addWidget(sep())
+        root.addSpacing(14)
+
+        # ── HISTORY ──────────────────────────────────────────────────────────
+        clr_btn = QPushButton("Clear")
+        clr_btn.setObjectName("badge")
+        clr_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clr_btn.setFixedWidth(64)
+        sh_hdr = QHBoxLayout()
+        sh_hdr.setContentsMargins(0, 0, 0, 0)
+        sh_hdr.addWidget(section_header("Session History"))
+        sh_hdr.addStretch()
+        sh_hdr.addWidget(clr_btn)
+        root.addLayout(sh_hdr)
+        root.addSpacing(6)
+
+        # column header strip
+        _W_DATE, _W_ROUNDS, _W_RUN, _W_RATE, _W_SUCC = 110, 56, 64, 64, 56
+        def hist_row(d, r, rt, ra, su, header=False):
+            row = QWidget(); row.setStyleSheet("background:transparent;")
+            h = QHBoxLayout(row)
+            h.setContentsMargins(4, 1 if header else 2, 4, 1 if header else 2)
+            h.setSpacing(0)
+            d.setFixedWidth(_W_DATE); h.addWidget(d)
+            h.addStretch()
+            for w, width in ((r, _W_ROUNDS), (rt, _W_RUN), (ra, _W_RATE), (su, _W_SUCC)):
+                w.setFixedWidth(width)
+                w.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                h.addWidget(w); h.addSpacing(10)
+            return row
+
+        root.addWidget(hist_row(
+            lbl("Date",    sz=10, col=T3),
+            lbl("Rounds",  sz=10, col=T3),
+            lbl("Runtime", sz=10, col=T3),
+            lbl("Rate",    sz=10, col=T3),
+            lbl("Succ%",   sz=10, col=T3),
+            header=True,
+        ))
+        root.addSpacing(2)
+        root.addWidget(sep())
+        root.addSpacing(2)
+
+        hist_w = QWidget(); hist_w.setStyleSheet("background:transparent;")
+        hist_v = QVBoxLayout(hist_w)
+        hist_v.setContentsMargins(0, 0, 0, 0); hist_v.setSpacing(1)
+        root.addWidget(hist_w)
+        root.addStretch()
+
+        # ── refresh + reset handlers ─────────────────────────────────────────
+
+        def _rebuild_history():
+            while hist_v.count():
+                item = hist_v.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            hist = list(cfg.get("stats", {}).get("session_history", []))
+            if not hist:
+                hist_v.addWidget(lbl("No sessions yet.", sz=11, col=T3))
+                return
+            for entry in reversed(hist):
+                rounds = int(entry.get("rounds", 0))
+                aborts = int(entry.get("aborts", 0))
+                attempts = rounds + aborts
+                succ = (rounds / attempts * 100) if attempts else 0.0
+                hist_v.addWidget(hist_row(
+                    lbl(entry.get("date", ""),                        sz=11, col=T2),
+                    lbl(str(rounds),                                  sz=11, col=T1, bold=True),
+                    lbl(_fmt_time(entry.get("runtime_s", 0)),         sz=11, col=T2),
+                    lbl(f"{entry.get('rate_per_hr', 0.0):.1f}",       sz=11, col=T2),
+                    lbl(f"{succ:.0f}%",                               sz=11, col=T2),
+                ))
+
+        def _refresh_stats():
+            s = cfg.get("stats", {}) or {}
+            lt_rounds   = int(s.get("lifetime_rounds", 0))
+            lt_aborts   = int(s.get("lifetime_aborts", 0))
+            lt_clicks   = int(s.get("lifetime_clicks", 0))
+            lt_sessions = int(s.get("lifetime_sessions", 0))
+            lt_runtime  = float(s.get("lifetime_runtime_s", 0.0))
+            best_rate   = float(s.get("best_rate_per_hr", 0.0))
+            fastest     = float(s.get("fastest_round_s", 0.0))
+
+            avg_rate     = (lt_rounds / (lt_runtime / 3600)) if lt_runtime > 0 else 0.0
+            avg_per_round = (lt_clicks / lt_rounds) if lt_rounds > 0 else 0.0
+            attempts     = lt_rounds + lt_aborts
+            success      = (lt_rounds / attempts * 100) if attempts else 0.0
+
+            w = self._stats_widgets
+            w["lt_rounds"].setText(f"{lt_rounds}")
+            w["lt_clicks"].setText(f"{lt_clicks}")
+            w["lt_sessions"].setText(f"{lt_sessions}")
+            w["lt_runtime"].setText(_fmt_time(lt_runtime))
+            w["lt_rate"].setText(f"{avg_rate:.1f}")
+            w["lt_avg_per_round"].setText(f"{avg_per_round:.1f}")
+            w["lt_best_rate"].setText(f"{best_rate:.1f}")
+            w["lt_fastest"].setText(f"{fastest:.1f}s" if fastest > 0 else "—")
+            success_color = GREEN if success >= 80 else (AMBER if success >= 50 else RED)
+            w["lt_success"].setText(f"{success:.0f}%" if attempts else "—")
+            w["lt_success"].setStyleSheet(
+                f"color:{success_color}; font-size:22px; font-weight:700; "
+                "background:transparent;"
+            )
+
+            # Last session
+            hist = list(s.get("session_history", []))
+            if hist:
+                last = hist[-1]
+                rounds = int(last.get("rounds", 0))
+                aborts = int(last.get("aborts", 0))
+                clicks = int(last.get("clicks", 0))
+                attempts = rounds + aborts
+                succ = (rounds / attempts * 100) if attempts else 0.0
+                fr = float(last.get("fastest_round_s", 0.0))
+                w["ls_date"].setText(str(last.get("date", "")))
+                w["ls_rounds"].setText(str(rounds))
+                w["ls_aborts"].setText(str(aborts))
+                w["ls_clicks"].setText(str(clicks))
+                w["ls_runtime"].setText(_fmt_time(last.get("runtime_s", 0)))
+                w["ls_rate"].setText(f"{last.get('rate_per_hr', 0.0):.1f}")
+                w["ls_fastest"].setText(f"{fr:.1f}s" if fr > 0 else "—")
+                w["ls_success"].setText(f"{succ:.0f}%" if attempts else "—")
+            else:
+                for k in ("ls_date", "ls_rounds", "ls_aborts", "ls_clicks",
+                          "ls_runtime", "ls_rate", "ls_fastest", "ls_success"):
+                    w[k].setText("—")
+
+            _rebuild_history()
+
+        def _reset_lifetime():
+            s = cfg.setdefault("stats", {})
+            s["lifetime_rounds"]    = 0
+            s["lifetime_aborts"]    = 0
+            s["lifetime_clicks"]    = 0
+            s["lifetime_sessions"]  = 0
+            s["lifetime_runtime_s"] = 0.0
+            s["best_rate_per_hr"]   = 0.0
+            s["fastest_round_s"]    = 0.0
+            _save(cfg)
+            _refresh_stats()
+
+        def _clear_history():
+            cfg.setdefault("stats", {})["session_history"] = []
+            _save(cfg)
+            _refresh_stats()
+
+        rst_btn.clicked.connect(_reset_lifetime)
+        clr_btn.clicked.connect(_clear_history)
+
+        timer = QTimer(inner)
+        timer.timeout.connect(_refresh_stats)
+        timer.start(2000)
+        _refresh_stats()
+        return inner
+
+    # ══════════════════════════════════════════════════════════════════════════
     # Hotkeys tab — rebind + per-hotkey enable toggle
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -1210,14 +1545,12 @@ class Plugin(PluginBase):
     # ── hotkey actions ────────────────────────────────────────────────────────
 
     def _do_toggle(self):
-        state.enabled = not state.enabled
-        state.paused  = False
-        if state.enabled:
-            state.session_start = time.monotonic()
-            state.rounds_done = 0
-            state.last_round_s = None
+        going_on = not state.enabled
+        state.paused = False
+        if going_on:
+            self._begin_session()
         else:
-            state.session_start = None
+            self._end_session()
         _worker.reset_round()
         _bridge.update.emit()
 
@@ -1227,15 +1560,81 @@ class Plugin(PluginBase):
             _bridge.update.emit()
 
     def _do_emergency_stop(self):
-        state.enabled = False
-        state.paused  = False
-        state.session_start = None
+        if state.enabled:
+            self._end_session()
+        else:
+            state.enabled = False
+            state.paused  = False
         try:
             _kbd.release(KeyCode.from_char(cfg.get("interaction_key", "e")))
         except Exception:
             pass
         _worker.reset_round()
         _bridge.update.emit()
+
+    # ── session lifecycle ─────────────────────────────────────────────────────
+
+    def _begin_session(self):
+        state.enabled            = True
+        state.session_start      = time.monotonic()
+        state.session_started_at = time.time()
+        state.rounds_done        = 0
+        state.session_aborts     = 0
+        state.session_clicks     = 0
+        state.fastest_round_s    = None
+        state.last_round_s       = None
+
+    def _end_session(self):
+        self._commit_session()
+        state.enabled            = False
+        state.paused             = False
+        state.session_start      = None
+        state.session_started_at = None
+
+    def _commit_session(self):
+        """Persist the current session into stats. No-op for empty sessions."""
+        if state.session_start is None:
+            return
+        runtime = time.monotonic() - state.session_start
+        rounds  = int(state.rounds_done)
+        aborts  = int(state.session_aborts)
+        clicks  = int(state.session_clicks)
+
+        # ignore zero-content sessions (toggled on then off immediately)
+        if runtime < 1.0 and rounds == 0 and aborts == 0:
+            return
+
+        rate = (rounds / (runtime / 3600)) if runtime > 0 else 0.0
+        s = cfg.setdefault("stats", {})
+        s["lifetime_rounds"]    = int(s.get("lifetime_rounds",   0)) + rounds
+        s["lifetime_aborts"]    = int(s.get("lifetime_aborts",   0)) + aborts
+        s["lifetime_clicks"]    = int(s.get("lifetime_clicks",   0)) + clicks
+        s["lifetime_sessions"]  = int(s.get("lifetime_sessions", 0)) + 1
+        s["lifetime_runtime_s"] = float(s.get("lifetime_runtime_s", 0.0)) + runtime
+        if rate > float(s.get("best_rate_per_hr", 0.0)):
+            s["best_rate_per_hr"] = rate
+        if state.fastest_round_s is not None:
+            cur_fastest = float(s.get("fastest_round_s", 0.0))
+            if cur_fastest <= 0 or state.fastest_round_s < cur_fastest:
+                s["fastest_round_s"] = float(state.fastest_round_s)
+
+        history = list(s.get("session_history", []))
+        history.append({
+            "date":            time.strftime(
+                "%Y-%m-%d %H:%M",
+                time.localtime(state.session_started_at or time.time())),
+            "rounds":          rounds,
+            "aborts":          aborts,
+            "clicks":          clicks,
+            "runtime_s":       runtime,
+            "rate_per_hr":     rate,
+            "fastest_round_s": float(state.fastest_round_s)
+                               if state.fastest_round_s is not None else 0.0,
+        })
+        if len(history) > 50:
+            history = history[-50:]
+        s["session_history"] = history
+        _save(cfg)
 
     # ── persistent hotkey listener ────────────────────────────────────────────
 
@@ -1404,9 +1803,12 @@ class Plugin(PluginBase):
     # ── unload ────────────────────────────────────────────────────────────────
 
     def on_unload(self):
+        if state.enabled:
+            self._commit_session()
         state.enabled = False
         state.paused  = False
         state.session_start = None
+        state.session_started_at = None
         _worker.stop()
         if self._listener:
             try: self._listener.stop()
