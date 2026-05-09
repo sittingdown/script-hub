@@ -92,6 +92,15 @@ _DEF = {
 
     "auto_pause_unfocused": True,
 
+    # Food / drink break — pause every N minutes, press eat + drink keys,
+    # wait for the consume animations, then resume.
+    "fd_break_enabled":  False,
+    "fd_interval_min":   10.0,    # how often a break happens
+    "fd_duration_s":     5.0,     # how long the bot stays paused
+    "fd_eat_key":        "4",
+    "fd_drink_key":      "5",
+    "fd_eat_first":      True,    # press eat before drink (vs both interleaved)
+
     "discord_webhook_url":  "",
     "discord_notify_end":   False,
 
@@ -319,6 +328,8 @@ class _State:
     round_start         = None    # monotonic seconds, current round start
     streak              = 0       # successful rounds in a row, reset on abort
     last_stopped_at     = None    # monotonic seconds of last stop (for fade)
+    last_break_at       = None    # monotonic seconds of last food/drink break
+    breaks_done         = 0       # food/drink breaks completed this session
 
 state = _State()
 
@@ -359,6 +370,50 @@ class _Worker:
         return self._running and state.enabled and not state.paused and (
             (not cfg.get("auto_pause_unfocused", True)) or state.focused
         )
+
+    def _do_food_drink_break(self) -> bool:
+        """
+        Press eat key, press drink key, then sleep for the configured duration.
+        Updates ``state.last_break_at`` and ``state.breaks_done`` on success.
+        Returns False if the break was interrupted (stopped/paused), so the
+        worker loop knows to re-evaluate.
+        """
+        state.phase = "BREAK"
+        _bridge.update.emit()
+
+        eat_key   = cfg.get("fd_eat_key", "4")
+        drink_key = cfg.get("fd_drink_key", "5")
+        eat_first = bool(cfg.get("fd_eat_first", True))
+        duration  = float(cfg.get("fd_duration_s", 5.0))
+
+        # Park cursor at wait point so neither press lands on something
+        # interactive
+        wp = cfg.get("wait_point") or {}
+        if wp.get("x") or wp.get("y"):
+            _move_to(wp["x"], wp["y"])
+            time.sleep(0.05)
+
+        if not self._continue():
+            return False
+
+        # Press the consume keys, in order, with a small pause between
+        keys = (eat_key, drink_key) if eat_first else (drink_key, eat_key)
+        for k in keys:
+            if not self._continue():
+                return False
+            _press_key(k, hold=0.06)
+            time.sleep(0.25)
+
+        # Wait out the consume animations (cooldown bar fills during the wait)
+        self._cd_sleep(duration, "food / drink break")
+
+        if not self._continue():
+            return False
+
+        state.last_break_at = time.monotonic()
+        state.breaks_done  += 1
+        _bridge.update.emit()
+        return True
 
     def _cd_sleep(self, secs: float, label: str):
         """Sleep emitting cooldown progress. Aborts if stopped/paused."""
@@ -426,12 +481,21 @@ class _Worker:
                     time.sleep(0.1)
                     continue
 
+                # ── FOOD / DRINK BREAK ────────────────────────────────────────
+                if cfg.get("fd_break_enabled", False):
+                    interval_s = float(cfg.get("fd_interval_min", 10.0)) * 60.0
+                    if (state.last_break_at is not None
+                            and (time.monotonic() - state.last_break_at) >= interval_s):
+                        if not self._do_food_drink_break():
+                            continue   # stopped/paused mid-break, re-evaluate
+
                 # ── PRESS E ───────────────────────────────────────────────────
                 state.phase = "PRESS_E"
                 state.round_start = time.monotonic()
                 _bridge.update.emit()
                 _press_key(cfg.get("interaction_key", "e"), hold=0.05)
-                self._cd_sleep(cfg.get("post_e_delay", 0.6), "post-E delay")
+                self._wait_open_or_delay(cfg.get("post_e_delay", 0.6),
+                                         "waiting for minigame")
                 if not self._continue(): continue
 
                 # ── PARK MOUSE ────────────────────────────────────────────────
@@ -631,6 +695,7 @@ _PHASE_TEXT = {
     "PARK":        ("PARKING",     GREEN),
     "SCAN":        ("SCANNING",    GREEN),
     "COOLDOWN":    ("COOLDOWN",    BLUE),
+    "BREAK":       ("FOOD / DRINK BREAK", BLUE),
     "NEEDS_SETUP": ("NEEDS SETUP", RED),
     "UNFOCUSED":   ("UNFOCUSED",   AMBER),
     "PAUSED":      ("PAUSED",      AMBER),
@@ -643,6 +708,7 @@ _OV_PHASE = {
     "PARK":        ("Parking",      GREEN),
     "SCAN":        ("Scanning",     GREEN),
     "COOLDOWN":    ("Cooldown",     BLUE),
+    "BREAK":       ("Eating",       BLUE),
     "NEEDS_SETUP": ("Needs setup",  RED),
 }
 
@@ -682,8 +748,10 @@ _TIP = {
         "as finished. Too low = bot presses E before the minigame closes."
     ),
     "post_e_delay": (
-        "Pause after pressing E before scanning starts. Should be just long "
-        "enough for the minigame UI to render."
+        "Maximum pause after pressing E before scanning starts. If a "
+        "Minigame Marker is configured, the bot polls it and continues the "
+        "moment the UI appears — so this becomes an upper bound, not a "
+        "fixed wait. Without a marker, this is a hard sleep."
     ),
     "post_round_delay": (
         "Cooldown after a round before the next E press. FiveM gameplay "
@@ -718,6 +786,14 @@ _TIP = {
     "marker_min_px": (
         "Minimum matching pixels in the marker region for the minigame to "
         "be considered open. Tighten if you get false positives."
+    ),
+    "fd_interval_min": (
+        "How often the bot pauses to eat/drink, in minutes. Counts only "
+        "active runtime — pauses don't count down."
+    ),
+    "fd_duration_s": (
+        "How long the bot stays paused per food/drink break. Should be at "
+        "least as long as your in-game eat + drink animations."
     ),
 }
 
@@ -1042,18 +1118,26 @@ class Plugin(PluginBase):
         self._marker_color_list_w = None
         self._marker_test_lbl     = None
         self._marker_live_timer   = None
+        self._fd_eat_badge        = None
+        self._fd_drink_badge      = None
         self._sparkline       = None
         self._fivem_warn      = None  # dashboard "FiveM not detected" chip
         self._streak_lbl      = None
         self._wizard_shown    = False
         self._dash            = {}    # field name → QWidget for refresh
 
-        _bridge.hk_toggle.connect(self._do_toggle)
-        _bridge.hk_pause.connect(self._do_pause)
-        _bridge.hk_estop.connect(self._do_emergency_stop)
-        _bridge.hk_select_wait.connect(self._do_pick_wait)
-        _bridge.hk_select_region.connect(self._do_pick_region)
-        _bridge.hk_select_color.connect(self._do_pick_color)
+        # Wrap every bridge → action connection in an "is this hotkey still
+        # enabled?" guard. This catches ghost listeners (listeners from
+        # earlier plugin instances whose Win32 hook didn't fully tear down)
+        # firing stale signals — without the guard, a disabled hotkey can
+        # still trigger its action because the ghost listener has the old
+        # sig_map cached.
+        _bridge.hk_toggle.connect(self._guarded("toggle",         self._do_toggle))
+        _bridge.hk_pause.connect(self._guarded("pause",           self._do_pause))
+        _bridge.hk_estop.connect(self._guarded("emergency_stop",  self._do_emergency_stop))
+        _bridge.hk_select_wait.connect(self._guarded("select_wait",   self._do_pick_wait))
+        _bridge.hk_select_region.connect(self._guarded("select_region", self._do_pick_region))
+        _bridge.hk_select_color.connect(self._guarded("select_color",  self._do_pick_color))
         _bridge.hk_fired.connect(self._on_hk_fired)
 
         # ── Status overlay — lives for the plugin's lifetime ───────────────────
@@ -1586,6 +1670,69 @@ class Plugin(PluginBase):
         sw.toggled.connect(lambda v: (cfg.update({"auto_pause_unfocused": v}),
                                       _save(cfg)))
         root.addLayout(_hrow(lbl("Auto-pause when unfocused", sz=12, col=T2), sw))
+        root.addSpacing(20)
+
+        # ── Food / Drink Break ────────────────────────────────────────────────
+        root.addWidget(section_header("Food / Drink Break"))
+        root.addSpacing(6)
+        root.addWidget(lbl(
+            "Periodically pause the bot, press the eat and drink keys, then "
+            "wait out the consume animations before resuming. Only counts "
+            "active runtime — pauses don't count toward the interval.",
+            sz=10, col=T3, wrap=True))
+        root.addSpacing(10)
+
+        fd_sw = ToggleSwitch(bool(cfg.get("fd_break_enabled", False)))
+        fd_sw.toggled.connect(lambda v: (cfg.update({"fd_break_enabled": v}),
+                                          _save(cfg)))
+        root.addLayout(_hrow(lbl("Enable food / drink break", sz=12, col=T2), fd_sw))
+        root.addSpacing(8)
+
+        # Eat key (rebindable badge)
+        eat_badge = QPushButton(cfg.get("fd_eat_key", "4").upper())
+        eat_badge.setObjectName("badge")
+        eat_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        eat_badge.setToolTip("Click to rebind — key the bot presses to eat")
+        eat_badge.setProperty("capturing", False)
+        eat_badge.clicked.connect(lambda _=None: self._start_fd_capture("eat"))
+        self._fd_eat_badge = eat_badge
+        root.addLayout(_hrow(lbl("Eat key", sz=12, col=T2), eat_badge))
+        root.addSpacing(6)
+
+        # Drink key (rebindable badge)
+        drink_badge = QPushButton(cfg.get("fd_drink_key", "5").upper())
+        drink_badge.setObjectName("badge")
+        drink_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        drink_badge.setToolTip("Click to rebind — key the bot presses to drink")
+        drink_badge.setProperty("capturing", False)
+        drink_badge.clicked.connect(lambda _=None: self._start_fd_capture("drink"))
+        self._fd_drink_badge = drink_badge
+        root.addLayout(_hrow(lbl("Drink key", sz=12, col=T2), drink_badge))
+        root.addSpacing(8)
+
+        # Interval (minutes)
+        iv = NumericStepper(float(cfg.get("fd_interval_min", 10.0)),
+                            step=0.5, min_val=0.5, max_val=120.0, fmt="{:.1f}")
+        iv.setToolTip(_TIP["fd_interval_min"])
+        iv.changed.connect(lambda v: (cfg.update({"fd_interval_min": float(v)}),
+                                       _save(cfg)))
+        root.addLayout(_hrow(lbl("Break every (min)", sz=12, col=T2), iv))
+        root.addSpacing(6)
+
+        # Duration (seconds)
+        du = NumericStepper(float(cfg.get("fd_duration_s", 5.0)),
+                            step=0.5, min_val=0.5, max_val=60.0, fmt="{:.1f}")
+        du.setToolTip(_TIP["fd_duration_s"])
+        du.changed.connect(lambda v: (cfg.update({"fd_duration_s": float(v)}),
+                                       _save(cfg)))
+        root.addLayout(_hrow(lbl("Break duration (s)", sz=12, col=T2), du))
+        root.addSpacing(6)
+
+        # Eat-first toggle
+        ef = ToggleSwitch(bool(cfg.get("fd_eat_first", True)))
+        ef.setToolTip("If on, eat then drink. If off, drink then eat.")
+        ef.toggled.connect(lambda v: (cfg.update({"fd_eat_first": v}), _save(cfg)))
+        root.addLayout(_hrow(lbl("Eat before drink", sz=12, col=T2), ef))
         root.addSpacing(20)
 
         # ── Status Overlay ────────────────────────────────────────────────────
@@ -2565,6 +2712,8 @@ class Plugin(PluginBase):
         state.last_round_s       = None
         state.streak             = 0
         state.last_stopped_at    = None
+        state.last_break_at      = time.monotonic()
+        state.breaks_done        = 0
 
     def _end_session(self):
         self._commit_session()
@@ -2669,9 +2818,27 @@ class Plugin(PluginBase):
     # ── live hotkey indicator ─────────────────────────────────────────────────
 
     def _on_hk_fired(self, name: str):
+        # also gated by current enable state — don't pulse for ghost-listener
+        # signals coming in for a hotkey the user has since disabled
+        _, en = _get_hk(name)
+        if not en:
+            return
         dot = self._hk_dots.get(name)
         if dot:
             dot.pulse()
+
+    # ── enable-state guard wrapper ────────────────────────────────────────────
+
+    def _guarded(self, hk_name: str, action):
+        """Wrap an action so it only runs when its hotkey is currently enabled.
+        Use for bridge → handler connections; UI paths (wizard, settings
+        buttons) should call the underlying ``_do_*`` method directly so the
+        guard never blocks legitimate non-hotkey triggers."""
+        def runner(*_a, **_kw):
+            _, en = _get_hk(hk_name)
+            if en:
+                action()
+        return runner
 
     # ── hotkey conflict detection ─────────────────────────────────────────────
 
@@ -2709,9 +2876,18 @@ class Plugin(PluginBase):
     def _start_listener(self):
         """(Re)build the pynput listener with the current key→signal mapping."""
         if self._listener is not None:
-            try: self._listener.stop()
-            except Exception: pass
+            old = self._listener
             self._listener = None
+            try: old.stop()
+            except Exception: pass
+            # Wait for the old hook thread to fully exit. Without this, the
+            # new Listener's hook is installed alongside the old one for a
+            # brief window — every key press fires BOTH hooks, the old one
+            # using the stale sig_map. For action hotkeys like Toggle Bot
+            # that means the action runs twice (no-net effect), which looks
+            # exactly like "the hotkey toggle doesn't work."
+            try: old.join(timeout=1.0)
+            except Exception: pass
 
         sig_map = {}
         for name, signal in (
@@ -2787,6 +2963,20 @@ class Plugin(PluginBase):
             QTimer.singleShot(0, apply_ik)
             return
 
+        # food / drink consume keys
+        if action in ("_fd_eat", "_fd_drink"):
+            cfg_key = "fd_eat_key" if action == "_fd_eat" else "fd_drink_key"
+            badge = self._fd_eat_badge if action == "_fd_eat" else self._fd_drink_badge
+            cfg[cfg_key] = k
+            _save(cfg)
+            def apply_fd():
+                if badge:
+                    badge.setText(k.upper())
+                    badge.setProperty("capturing", False)
+                    badge.style().unpolish(badge); badge.style().polish(badge)
+            QTimer.singleShot(0, apply_fd)
+            return
+
         _set_hk(action, key=k)
 
         def apply():
@@ -2810,6 +3000,18 @@ class Plugin(PluginBase):
             self._ik_badge.setProperty("capturing", True)
             self._ik_badge.style().unpolish(self._ik_badge)
             self._ik_badge.style().polish(self._ik_badge)
+
+    def _start_fd_capture(self, kind: str):
+        """Rebind capture for the eat/drink consume keys."""
+        if self._capturing_for:
+            return
+        self._capturing_for = "_fd_eat" if kind == "eat" else "_fd_drink"
+        badge = self._fd_eat_badge if kind == "eat" else self._fd_drink_badge
+        if badge:
+            badge.setText("…")
+            badge.setProperty("capturing", True)
+            badge.style().unpolish(badge)
+            badge.style().polish(badge)
 
     # ── tick (focus check + dashboard refresh) ────────────────────────────────
 
@@ -2894,9 +3096,17 @@ class Plugin(PluginBase):
         state.session_started_at = None
         _worker.stop()
         if self._listener:
-            try: self._listener.stop()
-            except Exception: pass
+            old = self._listener
             self._listener = None
+            try: old.stop()
+            except Exception: pass
+            # Wait for the Win32 hook thread to fully exit, otherwise the
+            # next plugin instance after a hub refresh ends up with this
+            # ghost listener still alive — which is exactly the case where
+            # disabled hotkeys keep firing because the ghost has the old
+            # sig_map cached.
+            try: old.join(timeout=1.0)
+            except Exception: pass
         try:
             self._overlay_timer.stop()
         except Exception:
