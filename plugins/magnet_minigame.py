@@ -77,6 +77,7 @@ _DEF = {
     "minigame_gone_for": 0.8,
     "post_round_delay":  3.40,
     "max_round_wait":    12.0,
+    "stuck_recovery_s":  2.5,
 
     "auto_pause_unfocused": True,
 
@@ -404,6 +405,14 @@ class _Worker:
                 last_seen     = scan_start
                 seen_anything = False
                 aborted       = False
+                stuck_since   = None
+                stuck_attempts = 0
+                stuck_thresh  = float(cfg.get("stuck_recovery_s", 2.5))
+                # offset cycle for repeated force-clicks — try different
+                # parts of the cluster's icon body each time
+                _OFFSETS = [(0, 0), (-15, -15), (15, 15),
+                            (-15, 15), (15, -15), (-22, 0),
+                            (22, 0), (0, -22), (0, 22)]
 
                 while self._continue() and state.phase == "SCAN":
                     now = time.monotonic()
@@ -415,7 +424,9 @@ class _Worker:
                     if centers:
                         seen_anything = True
                         last_seen = now
-                        # cap defensively in case false positives appear
+                        any_clicked = False
+                        # First pass — click any cluster whose centroid is
+                        # outside the dedupe radius of every prior click.
                         for cx, cy in centers[:max_targets]:
                             if not self._continue():
                                 break
@@ -427,11 +438,56 @@ class _Worker:
                                 state.clicks_round  += 1
                                 state.session_clicks += 1
                                 _bridge.update.emit()
-                                # park cursor between clicks so it doesn't
-                                # cover the next icon's colour pixels
                                 if wp.get("x") or wp.get("y"):
                                     _move_to(wp["x"], wp["y"])
+                                any_clicked = True
+
+                        # Stuck recovery — clusters persist but every centroid
+                        # is within the dedupe radius of a previous click.
+                        # This happens when two icons overlap into a single
+                        # merged blob: clicking the centroid hits one icon,
+                        # the surviving icon's new centroid lands close enough
+                        # to the original click to be filtered out forever.
+                        if any_clicked or stuck_thresh <= 0:
+                            stuck_since = None
+                            stuck_attempts = 0
+                        elif stuck_since is None:
+                            stuck_since = now
+                        elif (now - stuck_since) >= stuck_thresh:
+                            target = None
+                            if self._clicked:
+                                # pick the cluster furthest from any prior click
+                                best_d2 = -1
+                                for cx, cy in centers:
+                                    ax = rgx + cx
+                                    ay = rgy + cy
+                                    d2 = min(
+                                        (ax - px) * (ax - px) + (ay - py) * (ay - py)
+                                        for px, py in self._clicked
+                                    )
+                                    if d2 > best_d2:
+                                        best_d2 = d2
+                                        target = (ax, ay)
+                            else:
+                                cx, cy = centers[0]
+                                target = (rgx + cx, rgy + cy)
+
+                            if target:
+                                ox, oy = _OFFSETS[stuck_attempts % len(_OFFSETS)]
+                                ax = target[0] + ox
+                                ay = target[1] + oy
+                                _click_at(ax, ay, hold=click_h)
+                                self._clicked.append((ax, ay))
+                                state.clicks_round  += 1
+                                state.session_clicks += 1
+                                _bridge.update.emit()
+                                if wp.get("x") or wp.get("y"):
+                                    _move_to(wp["x"], wp["y"])
+                                stuck_attempts += 1
+                                stuck_since = now    # arm next recovery
                     else:
+                        stuck_since = None
+                        stuck_attempts = 0
                         if seen_anything:
                             if (now - last_seen) >= gone_for:
                                 break
@@ -556,6 +612,11 @@ _TIP = {
     "max_round_wait": (
         "Abort and retry pressing E if no icons appear within this many "
         "seconds. 0 disables the timeout (waits forever)."
+    ),
+    "stuck_recovery_s": (
+        "If clusters persist this long without any new clicks (e.g. two "
+        "icons overlap into one cluster and dedupe blocks the surviving "
+        "one), force-click anyway with a small offset. 0 disables."
     ),
 }
 
@@ -1261,6 +1322,7 @@ class Plugin(PluginBase):
             ("Dedupe Radius (px)",     "dedupe_radius",     10,  100,   5,  "{:.0f}"),
             ("Max Targets / Scan",     "max_targets",        1,   25,   1,  "{:.0f}"),
             ("Round-end Idle (s)",     "minigame_gone_for", 0.2, 3.0, 0.1,  "{:.1f}"),
+            ("Stuck Recovery (s)",     "stuck_recovery_s",  0.0, 10.0, 0.5, "{:.1f}"),
         ]:
             is_int = step >= 1 and fmt == "{:.0f}"
             st = NumericStepper(cfg.get(key, _DEF[key]),
