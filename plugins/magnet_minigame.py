@@ -78,6 +78,17 @@ _DEF = {
     "post_round_delay":  3.40,
     "max_round_wait":    12.0,
     "stuck_recovery_s":  2.5,
+    "scan_hard_timeout": 30.0,
+
+    # Minigame marker — optional safety net.
+    # If configured, the bot watches this region for the marker color while
+    # scanning for icons. The moment the marker disappears (minigame UI
+    # closed), the round ends — even if there are still ghost icon pixels in
+    # the icon region.
+    "marker_region":    {"x": 0, "y": 0, "width": 0, "height": 0},
+    "marker_colors":    [],
+    "marker_tolerance": 8,
+    "marker_min_px":    50,
 
     "auto_pause_unfocused": True,
 
@@ -248,6 +259,32 @@ def _find_components(mask, min_pixels: int):
             centers.append((cx_sum // n, cy_sum // n))
     return centers
 
+# ── minigame-open marker check ────────────────────────────────────────────────
+
+def _minigame_marker_configured() -> bool:
+    rg = cfg.get("marker_region", {}) or {}
+    return bool(cfg.get("marker_colors")
+                and rg.get("width") and rg.get("height"))
+
+def _minigame_open() -> bool | None:
+    """
+    True/False if the marker is configured and we can capture; None when no
+    marker is set or capture fails (so callers know to fall back to the
+    icon-based heuristics).
+    """
+    if not _minigame_marker_configured():
+        return None
+    try:
+        rg     = cfg["marker_region"]
+        colors = cfg["marker_colors"]
+        tol    = int(cfg.get("marker_tolerance", 15))
+        min_px = int(cfg.get("marker_min_px", 30))
+        img  = capture_region(rg)
+        mask = build_color_mask(img, colors, tol)
+        return int(mask.sum()) >= min_px
+    except Exception:
+        return None
+
 # ── bridge: worker → Qt main thread ───────────────────────────────────────────
 
 class _Bridge(QObject):
@@ -339,6 +376,34 @@ class _Worker:
             _bridge.cooldown.emit(elapsed, total, label)
             time.sleep(0.05)
 
+    def _wait_open_or_delay(self, secs: float, label: str):
+        """
+        Adaptive post-E wait. If the minigame marker is configured, poll it
+        and break the moment it shows the minigame is open — saves time on
+        rounds where the UI opens quickly. Falls back to a fixed sleep when
+        no marker is set. Bounded by ``secs`` either way, so it's never
+        slower than the old fixed-sleep version.
+        """
+        if not _minigame_marker_configured():
+            self._cd_sleep(secs, label)
+            return
+        total = max(0.0, float(secs))
+        if total <= 0:
+            return
+        start = time.monotonic()
+        while True:
+            if not self._continue():
+                return
+            if _minigame_open() is True:
+                _bridge.cooldown.emit(0.0, 0.0, "")   # clear the bar
+                return
+            elapsed = time.monotonic() - start
+            if elapsed >= total:
+                _bridge.cooldown.emit(total, total, "")
+                return
+            _bridge.cooldown.emit(elapsed, total, label)
+            time.sleep(0.05)
+
     def _run(self):
         while self._running:
             try:
@@ -408,6 +473,11 @@ class _Worker:
                 stuck_since   = None
                 stuck_attempts = 0
                 stuck_thresh  = float(cfg.get("stuck_recovery_s", 2.5))
+                hard_timeout  = float(cfg.get("scan_hard_timeout", 30.0))
+                marker_on     = _minigame_marker_configured()
+                marker_was_open      = False
+                marker_check_iv      = 0.4         # seconds between marker probes
+                last_marker_check    = scan_start - marker_check_iv  # check first iter
                 # offset cycle for repeated force-clicks — try different
                 # parts of the cluster's icon body each time
                 _OFFSETS = [(0, 0), (-15, -15), (15, 15),
@@ -416,6 +486,24 @@ class _Worker:
 
                 while self._continue() and state.phase == "SCAN":
                     now = time.monotonic()
+
+                    # ── safety: hard timeout — last-resort exit ───────────────
+                    if hard_timeout > 0 and (now - scan_start) >= hard_timeout:
+                        aborted = True
+                        break
+
+                    # ── safety: minigame marker (optional, takes precedence) ──
+                    if marker_on and (now - last_marker_check) >= marker_check_iv:
+                        last_marker_check = now
+                        is_open = _minigame_open()
+                        if is_open is True:
+                            marker_was_open = True
+                            seen_anything   = True   # marker confirms minigame is up
+                            last_seen       = now
+                        elif is_open is False and marker_was_open:
+                            # Marker disappeared after being seen → minigame closed
+                            break
+
                     img = capture_region(region)
                     mask = build_color_mask(img, colors, tolerance)
                     centers = _find_components(mask, min_px)
@@ -617,6 +705,19 @@ _TIP = {
         "If clusters persist this long without any new clicks (e.g. two "
         "icons overlap into one cluster and dedupe blocks the surviving "
         "one), force-click anyway with a small offset. 0 disables."
+    ),
+    "scan_hard_timeout": (
+        "Force-end the round after this many seconds of scanning, no matter "
+        "what. Last-resort safety against the bot getting stuck forever. "
+        "0 disables (only Max Round Wait still applies)."
+    ),
+    "marker_tolerance": (
+        "Per-channel RGB distance for marker color matching. Same idea as "
+        "the icon Color Tolerance, but for the minigame marker."
+    ),
+    "marker_min_px": (
+        "Minimum matching pixels in the marker region for the minigame to "
+        "be considered open. Tighten if you get false positives."
     ),
 }
 
@@ -937,6 +1038,10 @@ class Plugin(PluginBase):
         self._test_lbl        = None  # Settings → Test Detection result
         self._color_feedback  = None  # transient "X pixels match" label
         self._color_fb_timer  = None
+        self._marker_region_lbl   = None
+        self._marker_color_list_w = None
+        self._marker_test_lbl     = None
+        self._marker_live_timer   = None
         self._sparkline       = None
         self._fivem_warn      = None  # dashboard "FiveM not detected" chip
         self._streak_lbl      = None
@@ -1350,6 +1455,93 @@ class Plugin(PluginBase):
         test_row.addSpacing(10)
         test_row.addWidget(self._test_lbl, 1)
         root.addLayout(test_row)
+        root.addSpacing(20)
+
+        # ── Minigame Marker (optional) ────────────────────────────────────────
+        root.addWidget(section_header("Minigame Marker (optional)"))
+        root.addSpacing(6)
+        root.addWidget(lbl(
+            "Pick a region and color that's only visible while the minigame "
+            "UI is open — for example, the orange 'MAGNET FISHING' title or "
+            "the depth ruler. The bot ends the round the moment this marker "
+            "disappears, which prevents it from getting stuck on ghost icons.",
+            sz=10, col=T3, wrap=True))
+        root.addSpacing(8)
+
+        mr = cfg.get("marker_region", {}) or {}
+        self._marker_region_lbl = lbl(self._fmt_region(mr), sz=12, col=T1, bold=True)
+        mr_btn = QPushButton("Pick Region")
+        mr_btn.setObjectName("action")
+        mr_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        mr_btn.clicked.connect(self._do_pick_marker_region)
+        root.addLayout(_hrow(lbl("Marker region", sz=12, col=T2),
+                             self._marker_region_lbl, mr_btn))
+        root.addSpacing(8)
+
+        root.addWidget(lbl("Marker colors", sz=12, col=T2))
+        root.addSpacing(4)
+        self._marker_color_list_w = QWidget()
+        self._marker_color_list_w.setStyleSheet("background:transparent;")
+        mcv = QVBoxLayout(self._marker_color_list_w)
+        mcv.setContentsMargins(0, 0, 0, 0); mcv.setSpacing(4)
+        root.addWidget(self._marker_color_list_w)
+
+        mc_btn = QPushButton("Add Color")
+        mc_btn.setObjectName("action")
+        mc_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        mc_btn.clicked.connect(self._do_pick_marker_color)
+        mc_row = QHBoxLayout(); mc_row.setContentsMargins(0, 0, 0, 0)
+        mc_row.addStretch(); mc_row.addWidget(mc_btn)
+        root.addLayout(mc_row)
+        self._refresh_marker_color_list()
+        root.addSpacing(8)
+
+        for label_text, key, lo, hi, step, fmt in [
+            ("Marker tolerance",    "marker_tolerance", 1,   50,   1, "{:.0f}"),
+            ("Marker min pixels",   "marker_min_px",    5,  500,   5, "{:.0f}"),
+        ]:
+            st = NumericStepper(cfg.get(key, _DEF[key]),
+                                step=step, min_val=lo, max_val=hi, fmt=fmt)
+            st.setToolTip(_TIP.get(key, ""))
+            st.changed.connect(lambda v, k=key: (cfg.update({k: int(v)}), _save(cfg)))
+            row_lbl = lbl(label_text, sz=12, col=T2)
+            row_lbl.setToolTip(_TIP.get(key, ""))
+            root.addLayout(_hrow(row_lbl, st))
+            root.addSpacing(6)
+
+        # Test Marker button + Live toggle
+        mtest_btn = QPushButton("Test Marker")
+        mtest_btn.setObjectName("action")
+        mtest_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        mtest_btn.clicked.connect(self._do_test_marker)
+        live_sw = ToggleSwitch(False)
+        live_sw.setToolTip(
+            "Continuously re-test every 400 ms — open/close the minigame "
+            "and watch the match count change so you can pick a good min-pixels threshold."
+        )
+        def _on_live(v):
+            if v:
+                if self._marker_live_timer is None:
+                    self._marker_live_timer = QTimer()
+                    self._marker_live_timer.timeout.connect(self._do_test_marker)
+                self._marker_live_timer.start(400)
+                self._do_test_marker()
+            else:
+                if self._marker_live_timer is not None:
+                    self._marker_live_timer.stop()
+        live_sw.toggled.connect(_on_live)
+
+        self._marker_test_lbl = lbl("", sz=11, col=T3, wrap=True)
+        mtest_row = QHBoxLayout()
+        mtest_row.setContentsMargins(0, 0, 0, 0)
+        mtest_row.addWidget(mtest_btn)
+        mtest_row.addSpacing(8)
+        mtest_row.addWidget(lbl("Live", sz=11, col=T3))
+        mtest_row.addSpacing(4)
+        mtest_row.addWidget(live_sw)
+        mtest_row.addSpacing(10)
+        mtest_row.addWidget(self._marker_test_lbl, 1)
+        root.addLayout(mtest_row)
         root.addSpacing(14)
 
         # ── Timing ────────────────────────────────────────────────────────────
@@ -1362,6 +1554,7 @@ class Plugin(PluginBase):
             ("Click Delay (s)",        "click_delay",      0.01, 1.0, 0.01, "{:.2f}"),
             ("Scan Interval (s)",      "scan_interval",   0.02, 0.5, 0.01, "{:.2f}"),
             ("Max Round Wait (s)",     "max_round_wait",  0.0, 60.0, 1.0, "{:.0f}"),
+            ("Hard Scan Timeout (s)",  "scan_hard_timeout", 0.0, 120.0, 5.0, "{:.0f}"),
         ]:
             st = NumericStepper(cfg.get(key, _DEF[key]),
                                 step=step, min_val=lo, max_val=hi, fmt=fmt)
@@ -2196,6 +2389,100 @@ class Plugin(PluginBase):
         _refresh_buttons()
         dlg.exec()
 
+    # ── Marker pickers + test ─────────────────────────────────────────────────
+
+    def _do_pick_marker_region(self):
+        if self._active_overlay is not None:
+            return
+        def cb(rect):
+            self._active_overlay = None
+            if rect is None:
+                return
+            cfg["marker_region"] = {
+                "x": int(rect["x"]), "y": int(rect["y"]),
+                "width": int(rect["width"]), "height": int(rect["height"]),
+            }
+            _save(cfg)
+            if self._marker_region_lbl:
+                self._marker_region_lbl.setText(self._fmt_region(cfg["marker_region"]))
+        self._active_overlay = RegionSelectorOverlay(None, cb)
+
+    def _do_pick_marker_color(self):
+        if self._active_overlay is not None:
+            return
+        def cb(r, g, b):
+            self._active_overlay = None
+            if r is None:
+                return
+            cfg.setdefault("marker_colors", []).append(
+                {"r": int(r), "g": int(g), "b": int(b)}
+            )
+            _save(cfg)
+            self._refresh_marker_color_list()
+        self._active_overlay = ColorPickerOverlay(None, cb)
+
+    def _refresh_marker_color_list(self):
+        if not self._marker_color_list_w:
+            return
+        layout = self._marker_color_list_w.layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for i, c in enumerate(list(cfg.get("marker_colors", []))):
+            r, g, b = c["r"], c["g"], c["b"]
+            sw = ColorSwatch(r, g, b)
+            sw.deleted.connect(lambda _=None, idx=i: self._delete_marker_color(idx))
+            layout.addWidget(sw)
+
+    def _delete_marker_color(self, idx: int):
+        try:
+            cfg["marker_colors"].pop(idx)
+            _save(cfg)
+            self._refresh_marker_color_list()
+        except Exception:
+            pass
+
+    def _do_test_marker(self):
+        if self._marker_test_lbl is None:
+            return
+        rg = cfg.get("marker_region", {}) or {}
+        colors = cfg.get("marker_colors", [])
+        if not rg.get("width") or not rg.get("height"):
+            self._marker_test_lbl.setText("⚠ marker region not set")
+            self._marker_test_lbl.setStyleSheet(f"color:{AMBER};")
+            return
+        if not colors:
+            self._marker_test_lbl.setText("⚠ no marker colors set")
+            self._marker_test_lbl.setStyleSheet(f"color:{AMBER};")
+            return
+        try:
+            tol    = int(cfg.get("marker_tolerance", 8))
+            min_px = int(cfg.get("marker_min_px", 50))
+            img    = capture_region(rg)
+            mask   = build_color_mask(img, colors, tol)
+            count  = int(mask.sum())
+            total  = int(mask.size)
+            pct    = (count / total * 100) if total else 0.0
+            is_open = count >= min_px
+
+            verdict = "OPEN" if is_open else "CLOSED"
+            color = GREEN if is_open else (AMBER if count > 0 else RED)
+            msg = (
+                f"{verdict}  ·  {count} / {total} px match "
+                f"({pct:.2f}%)  ·  threshold {min_px}  ·  tol {tol}"
+            )
+            # If the count is uncomfortably close to threshold, warn
+            if 0 < count < min_px and count > min_px * 0.7:
+                msg += "  ·  ⚠ close to threshold — raise min_px"
+            elif is_open and count < min_px * 1.5:
+                msg += "  ·  ⚠ barely over threshold — may flap"
+            self._marker_test_lbl.setText(msg)
+            self._marker_test_lbl.setStyleSheet(f"color:{color};")
+        except Exception as e:
+            self._marker_test_lbl.setText(f"Test failed: {e}")
+            self._marker_test_lbl.setStyleSheet(f"color:{RED};")
+
     # ── Test Detection ────────────────────────────────────────────────────────
 
     def _do_test_detection(self):
@@ -2612,6 +2899,11 @@ class Plugin(PluginBase):
             self._listener = None
         try:
             self._overlay_timer.stop()
+        except Exception:
+            pass
+        try:
+            if self._marker_live_timer is not None:
+                self._marker_live_timer.stop()
         except Exception:
             pass
         try:
