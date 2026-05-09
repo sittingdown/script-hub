@@ -9,15 +9,17 @@ import json
 import sys
 import time
 import threading
+import urllib.request
 from pathlib import Path
 
 import win32api
 import win32con
 from pynput.keyboard import Listener, Controller, Key, KeyCode
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QTimer, QPoint, QPointF, QRect, pyqtSignal, QObject
+from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QPolygonF
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QProgressBar,
-    QFrame, QLabel,
+    QFrame, QLabel, QLineEdit, QDialog, QApplication,
 )
 
 # Ensure project root is on sys.path so we can import sibling modules.
@@ -37,7 +39,7 @@ from overlays_qt import (
     RegionSelectorOverlay, PointSelectorOverlay, ColorPickerOverlay,
 )
 from detector import capture_region, build_color_mask
-from bot import is_fivem_focused
+from bot import is_fivem_focused, get_fivem_status
 import numpy as np
 
 # Optional scipy fast-path for pixel-level connected components.
@@ -77,6 +79,9 @@ _DEF = {
     "max_round_wait":    12.0,
 
     "auto_pause_unfocused": True,
+
+    "discord_webhook_url":  "",
+    "discord_notify_end":   False,
 
     "stats": {
         "lifetime_rounds":    0,
@@ -247,6 +252,7 @@ def _find_components(mask, min_pixels: int):
 class _Bridge(QObject):
     update           = pyqtSignal()
     cooldown         = pyqtSignal(float, float, str)  # elapsed, total, label
+    hk_fired         = pyqtSignal(str)                # action name — for live indicator
     hk_toggle        = pyqtSignal()
     hk_pause         = pyqtSignal()
     hk_estop         = pyqtSignal()
@@ -273,6 +279,8 @@ class _State:
     fastest_round_s     = None    # fastest single round in this session
     last_round_s        = None    # seconds the last round took
     round_start         = None    # monotonic seconds, current round start
+    streak              = 0       # successful rounds in a row, reset on abort
+    last_stopped_at     = None    # monotonic seconds of last stop (for fade)
 
 state = _State()
 
@@ -438,6 +446,7 @@ class _Worker:
                 # ── ROUND DONE ────────────────────────────────────────────────
                 if not aborted:
                     state.rounds_done += 1
+                    state.streak += 1
                     if state.round_start is not None:
                         dur = time.monotonic() - state.round_start
                         state.last_round_s = dur
@@ -446,6 +455,7 @@ class _Worker:
                             state.fastest_round_s = dur
                 else:
                     state.session_aborts += 1
+                    state.streak = 0
                 self.reset_round()
                 state.phase = "COOLDOWN"
                 _bridge.update.emit()
@@ -501,6 +511,53 @@ _OV_ROWS = (
     ("last_round", "Last round"),
     ("clusters",   "Clusters"),
 )
+
+# Per-tunable tooltips for Settings steppers
+_TIP = {
+    "color_tolerance": (
+        "Per-channel RGB distance allowed for a pixel to count as a match. "
+        "Higher = more pixels matched (catches shading variations) but risks "
+        "false positives. Recommended: 10."
+    ),
+    "min_cluster_px": (
+        "Smallest connected blob (in matching pixels) to be treated as an "
+        "icon. Lower this if icons look small or only their outlines match. "
+        "Raise it to ignore stray noise."
+    ),
+    "dedupe_radius": (
+        "Two cluster centers within this many pixels are treated as the same "
+        "icon. Lower if icons sit very close together; raise if a single "
+        "icon's centroid jitters and gets re-clicked."
+    ),
+    "max_targets": (
+        "Hard cap on icons clicked per scan tick. Defensive — prevents a "
+        "flood of false positives from causing rapid-fire clicks."
+    ),
+    "minigame_gone_for": (
+        "How long the region must show ZERO icons before the round counts "
+        "as finished. Too low = bot presses E before the minigame closes."
+    ),
+    "post_e_delay": (
+        "Pause after pressing E before scanning starts. Should be just long "
+        "enough for the minigame UI to render."
+    ),
+    "post_round_delay": (
+        "Cooldown after a round before the next E press. FiveM gameplay "
+        "throttle — match this to the in-game cooldown."
+    ),
+    "click_delay": (
+        "How long the left mouse button is held down per click. Too short "
+        "and FiveM may not register; too long and it slows the bot."
+    ),
+    "scan_interval": (
+        "Time between detection passes. Lower = faster reaction to icons "
+        "appearing/disappearing, more CPU. 0.03 is a good balance."
+    ),
+    "max_round_wait": (
+        "Abort and retry pressing E if no icons appear within this many "
+        "seconds. 0 disables the timeout (waits forever)."
+    ),
+}
 
 def _fmt_time(secs: float) -> str:
     if secs <= 0:
@@ -658,12 +715,133 @@ class _StatusOverlay(QWidget):
 
     def mouseMoveEvent(self, ev):
         if self._move_mode and self._drag_pos is not None:
-            self.move(ev.globalPosition().toPoint() - self._drag_pos)
+            target = ev.globalPosition().toPoint() - self._drag_pos
+            # snap to screen edges within 24 px
+            screen = self.screen() if self.screen() else QApplication.primaryScreen()
+            geo = screen.availableGeometry()
+            w, h = self.width(), self.height()
+            snap = 24
+            x, y = target.x(), target.y()
+            if abs(x - geo.left())     < snap: x = geo.left()
+            if abs(y - geo.top())      < snap: y = geo.top()
+            if abs(x + w - geo.right())  < snap: x = geo.right()  - w
+            if abs(y + h - geo.bottom()) < snap: y = geo.bottom() - h
+            self.move(x, y)
             ev.accept()
 
     def mouseReleaseEvent(self, ev):
         self._drag_pos = None
         ev.accept()
+
+# ── PulseDot (live key-down indicator) ────────────────────────────────────────
+
+class _PulseDot(QWidget):
+    """Tiny dot that flashes green for ~250 ms when ``pulse()`` is called."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(8, 8)
+        self.setStyleSheet("background:transparent;")
+        self._on    = False
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._reset)
+
+    def pulse(self):
+        self._on = True
+        self.update()
+        self._timer.start(250)
+
+    def _reset(self):
+        self._on = False
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        col = QColor(GREEN) if self._on else QColor("#1f2937")
+        p.setBrush(QBrush(col))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(0, 0, 8, 8)
+        p.end()
+
+# ── Sparkline (rate over recent sessions) ─────────────────────────────────────
+
+class _Sparkline(QWidget):
+    """Compact line chart of a list of floats, no axes — pure trend."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(40)
+        self.setMaximumHeight(40)
+        self.setStyleSheet("background:transparent;")
+        self._values: list[float] = []
+
+    def set_values(self, vals: list[float]):
+        self._values = [float(v) for v in vals if v is not None]
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        # background card
+        p.setBrush(QBrush(QColor("#0f0f0f")))
+        p.setPen(QPen(QColor("#1e1e1e"), 1))
+        p.drawRoundedRect(0, 0, w - 1, h - 1, 4, 4)
+
+        if len(self._values) < 2:
+            p.setPen(QPen(QColor(T3)))
+            p.drawText(0, 0, w, h,
+                       Qt.AlignmentFlag.AlignCenter,
+                       "Not enough sessions yet")
+            p.end()
+            return
+
+        pad = 6
+        vw = w - pad * 2
+        vh = h - pad * 2
+        vals = self._values[-30:]   # last 30 points
+        vmin = min(vals); vmax = max(vals)
+        rng = (vmax - vmin) if vmax > vmin else 1.0
+        n = len(vals)
+        step = vw / max(1, n - 1)
+
+        # gradient fill under the line
+        pts = []
+        for i, v in enumerate(vals):
+            x = pad + i * step
+            y = pad + (1.0 - (v - vmin) / rng) * vh
+            pts.append((x, y))
+
+        # fill polygon (under-curve area, faint)
+        poly = QPolygonF()
+        poly.append(QPointF(pts[0][0], pad + vh))
+        for x, y in pts:
+            poly.append(QPointF(x, y))
+        poly.append(QPointF(pts[-1][0], pad + vh))
+        p.setBrush(QBrush(QColor(96, 165, 250, 40)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawPolygon(poly)
+
+        # line
+        p.setPen(QPen(QColor(BLUE), 1.6))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for i in range(len(pts) - 1):
+            p.drawLine(QPointF(*pts[i]), QPointF(*pts[i + 1]))
+
+        # last-point dot
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(BLUE)))
+        x, y = pts[-1]
+        p.drawEllipse(QPointF(x, y), 2.5, 2.5)
+
+        # min/max labels in corners
+        p.setFont(QFont("Segoe UI", 8))
+        p.setPen(QPen(QColor(T3)))
+        p.drawText(pad, h - 2, f"{vmin:.0f}")
+        p.drawText(w - pad - 28, h - 2, f"{vmax:.0f}")
+        p.end()
 
 # ── Plugin ────────────────────────────────────────────────────────────────────
 
@@ -689,10 +867,19 @@ class Plugin(PluginBase):
         self._active_overlay  = None   # holds picker overlay so PyQt doesn't GC it
         self._badges          = {}    # name → rebind QPushButton (Hotkeys tab)
         self._hk_chips        = {}    # name → chip QLabel (dashboard strip)
+        self._hk_dots         = {}    # name → _PulseDot (Hotkeys tab live indicator)
+        self._hk_warn_lbl     = None  # conflict warning at top of Hotkeys tab
         self._color_list_w    = None
         self._wait_lbl        = None
         self._region_lbl      = None
         self._ik_badge        = None
+        self._test_lbl        = None  # Settings → Test Detection result
+        self._color_feedback  = None  # transient "X pixels match" label
+        self._color_fb_timer  = None
+        self._sparkline       = None
+        self._fivem_warn      = None  # dashboard "FiveM not detected" chip
+        self._streak_lbl      = None
+        self._wizard_shown    = False
         self._dash            = {}    # field name → QWidget for refresh
 
         _bridge.hk_toggle.connect(self._do_toggle)
@@ -701,6 +888,7 @@ class Plugin(PluginBase):
         _bridge.hk_select_wait.connect(self._do_pick_wait)
         _bridge.hk_select_region.connect(self._do_pick_region)
         _bridge.hk_select_color.connect(self._do_pick_color)
+        _bridge.hk_fired.connect(self._on_hk_fired)
 
         # ── Status overlay — lives for the plugin's lifetime ───────────────────
         self._overlay = _StatusOverlay()
@@ -739,6 +927,8 @@ class Plugin(PluginBase):
         t.timeout.connect(self._tick)
         t.start(250)
         self._refresh_dashboard()
+        # show first-run wizard if nothing is configured yet
+        self._maybe_show_wizard()
         return container
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -751,11 +941,32 @@ class Plugin(PluginBase):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # FiveM-not-running warning chip (hidden when running)
+        self._fivem_warn = lbl("⚠ FiveM is not running", sz=11, col=AMBER,
+                               align=Qt.AlignmentFlag.AlignCenter)
+        self._fivem_warn.setStyleSheet(
+            f"color:{AMBER}; background:rgba(251,191,36,15);"
+            " border:1px solid rgba(251,191,36,80);"
+            " border-radius:4px; padding:4px 10px;"
+        )
+        self._fivem_warn.hide()
+        warn_row = QHBoxLayout(); warn_row.setContentsMargins(0, 0, 0, 0)
+        warn_row.addStretch(); warn_row.addWidget(self._fivem_warn); warn_row.addStretch()
+        root.addLayout(warn_row)
+        root.addSpacing(6)
+
         # state indicator
         state_lbl = lbl("STOPPED", sz=22, col=T3, bold=True,
                         align=Qt.AlignmentFlag.AlignCenter)
         root.addWidget(state_lbl)
-        root.addSpacing(6)
+        root.addSpacing(2)
+
+        # streak chip (hidden until streak ≥ 3)
+        self._streak_lbl = lbl("", sz=11, col=GREEN, bold=True,
+                               align=Qt.AlignmentFlag.AlignCenter)
+        self._streak_lbl.hide()
+        root.addWidget(self._streak_lbl)
+        root.addSpacing(4)
 
         # cooldown bar (hidden when idle)
         cd_bar = QProgressBar()
@@ -885,6 +1096,22 @@ class Plugin(PluginBase):
         unfocus_paused = (cfg.get("auto_pause_unfocused", True)
                           and not state.focused)
 
+        # FiveM-not-running warning
+        if self._fivem_warn:
+            try:
+                fivem_running, _ = get_fivem_status()
+            except Exception:
+                fivem_running = True
+            self._fivem_warn.setVisible(not fivem_running)
+
+        # Streak chip
+        if self._streak_lbl:
+            if state.enabled and state.streak >= 3:
+                self._streak_lbl.setText(f"🔥 streak: {state.streak}")
+                self._streak_lbl.show()
+            else:
+                self._streak_lbl.hide()
+
         if running and (manual_paused or unfocus_paused):
             if manual_paused:
                 pk, _ = _get_hk("pause")
@@ -950,7 +1177,7 @@ class Plugin(PluginBase):
     def _build_settings(self):
         inner = QWidget()
         root = QVBoxLayout(inner)
-        root.setContentsMargins(0, 8, 8, 16)
+        root.setContentsMargins(0, 8, 16, 16)
         root.setSpacing(0)
 
         # ── Wait Point ────────────────────────────────────────────────────────
@@ -1006,6 +1233,11 @@ class Plugin(PluginBase):
         col_hint.addStretch()
         col_hint.addLayout(self._hk_hint("select_color"))
         root.addLayout(col_hint)
+        root.addSpacing(4)
+
+        self._color_feedback = lbl("", sz=10, col=T3, wrap=True)
+        self._color_feedback.hide()
+        root.addWidget(self._color_feedback)
         root.addSpacing(20)
 
         # ── Color Tolerance ───────────────────────────────────────────────────
@@ -1014,6 +1246,7 @@ class Plugin(PluginBase):
 
         tol = NumericStepper(cfg.get("color_tolerance", 10),
                              step=1, min_val=1, max_val=100, fmt="{:.0f}")
+        tol.setToolTip(_TIP["color_tolerance"])
         tol.changed.connect(lambda v: (cfg.update({"color_tolerance": int(v)}),
                                        _save(cfg)))
         root.addLayout(_hrow(lbl("Tolerance  (recommended: 10)", sz=12, col=T2), tol))
@@ -1032,12 +1265,29 @@ class Plugin(PluginBase):
             is_int = step >= 1 and fmt == "{:.0f}"
             st = NumericStepper(cfg.get(key, _DEF[key]),
                                 step=step, min_val=lo, max_val=hi, fmt=fmt)
+            st.setToolTip(_TIP.get(key, ""))
             def _changed(v, k=key, ai=is_int):
                 cfg[k] = int(v) if ai else v
                 _save(cfg)
             st.changed.connect(_changed)
-            root.addLayout(_hrow(lbl(label_text, sz=12, col=T2), st))
+            row_lbl = lbl(label_text, sz=12, col=T2)
+            row_lbl.setToolTip(_TIP.get(key, ""))
+            root.addLayout(_hrow(row_lbl, st))
             root.addSpacing(6)
+        root.addSpacing(8)
+
+        # Test Detection button + result label
+        test_btn = QPushButton("Test Detection")
+        test_btn.setObjectName("action")
+        test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        test_btn.clicked.connect(self._do_test_detection)
+        self._test_lbl = lbl("", sz=11, col=T3, wrap=True)
+        test_row = QHBoxLayout()
+        test_row.setContentsMargins(0, 0, 0, 0)
+        test_row.addWidget(test_btn)
+        test_row.addSpacing(10)
+        test_row.addWidget(self._test_lbl, 1)
+        root.addLayout(test_row)
         root.addSpacing(14)
 
         # ── Timing ────────────────────────────────────────────────────────────
@@ -1053,8 +1303,11 @@ class Plugin(PluginBase):
         ]:
             st = NumericStepper(cfg.get(key, _DEF[key]),
                                 step=step, min_val=lo, max_val=hi, fmt=fmt)
+            st.setToolTip(_TIP.get(key, ""))
             st.changed.connect(lambda v, k=key: (cfg.update({k: v}), _save(cfg)))
-            root.addLayout(_hrow(lbl(label_text, sz=12, col=T2), st))
+            row_lbl = lbl(label_text, sz=12, col=T2)
+            row_lbl.setToolTip(_TIP.get(key, ""))
+            root.addLayout(_hrow(row_lbl, st))
             root.addSpacing(6)
         root.addSpacing(14)
 
@@ -1137,6 +1390,24 @@ class Plugin(PluginBase):
         root.addSpacing(12)
 
         # per-row visibility toggles
+        row_switches: dict[str, ToggleSwitch] = {}
+
+        # presets: Compact / Detailed
+        preset_row = QHBoxLayout(); preset_row.setContentsMargins(12, 0, 0, 0)
+        preset_row.addWidget(lbl("Preset", sz=10, col=T3))
+        preset_row.addStretch()
+        compact_btn = QPushButton("Compact")
+        detailed_btn = QPushButton("Detailed")
+        for b in (compact_btn, detailed_btn):
+            b.setObjectName("action")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        preset_row.addWidget(compact_btn)
+        preset_row.addSpacing(6)
+        preset_row.addWidget(detailed_btn)
+        root.addLayout(preset_row)
+        root.addSpacing(8)
+
+        # per-row visibility toggles
         root.addWidget(lbl("Display on overlay", sz=10, col=T3))
         root.addSpacing(8)
 
@@ -1144,6 +1415,7 @@ class Plugin(PluginBase):
         for key, label in _OV_ROWS:
             ck = f"show_{key}"
             sw_row = ToggleSwitch(bool(opts.get(ck, False)))
+            row_switches[ck] = sw_row
             def _on_opt(v, k=ck):
                 cur = dict(cfg.get("overlay_opts", {}) or {})
                 cur[k] = v
@@ -1158,6 +1430,66 @@ class Plugin(PluginBase):
             opt_row.addWidget(sw_row)
             root.addLayout(opt_row)
             root.addSpacing(4)
+
+        # preset handlers — Compact = runtime only, Detailed = everything
+        def _apply_preset(values: dict):
+            cur = dict(cfg.get("overlay_opts", {}) or {})
+            for k, v in values.items():
+                cur[k] = v
+                if k in row_switches:
+                    row_switches[k].set_checked(v)
+            cfg["overlay_opts"] = cur
+            _save(cfg)
+            self._update_overlay()
+
+        compact_btn.clicked.connect(lambda: _apply_preset({
+            "show_rounds": False, "show_rate": False, "show_runtime": True,
+            "show_clicks": False, "show_last_round": False, "show_clusters": False,
+        }))
+        detailed_btn.clicked.connect(lambda: _apply_preset({
+            "show_rounds": True, "show_rate": True, "show_runtime": True,
+            "show_clicks": True, "show_last_round": True, "show_clusters": True,
+        }))
+
+        root.addSpacing(20)
+
+        # ── Discord ──────────────────────────────────────────────────────────
+        root.addWidget(section_header("Discord"))
+        root.addSpacing(6)
+        root.addWidget(lbl(
+            "Optional. Posts a session summary to a Discord channel via webhook.",
+            sz=10, col=T3, wrap=True))
+        root.addSpacing(10)
+
+        root.addWidget(lbl("Webhook URL", sz=12, col=T2))
+        root.addSpacing(4)
+        wh_edit = QLineEdit()
+        wh_edit.setPlaceholderText("https://discord.com/api/webhooks/...")
+        wh_edit.setText(cfg.get("discord_webhook_url", ""))
+        wh_edit.setStyleSheet(
+            "QLineEdit { background:#0f0f0f; border:1px solid #2a2a2a;"
+            " border-radius:5px; padding:6px 8px; color:#e5e7eb; }"
+            "QLineEdit:focus { border-color:#3a3a3a; }"
+        )
+        wh_edit.editingFinished.connect(
+            lambda: (cfg.update({"discord_webhook_url": wh_edit.text().strip()}),
+                     _save(cfg)))
+        root.addWidget(wh_edit)
+        root.addSpacing(10)
+
+        ns_sw = ToggleSwitch(cfg.get("discord_notify_end", False))
+        ns_sw.toggled.connect(lambda v: (cfg.update({"discord_notify_end": v}),
+                                          _save(cfg)))
+        root.addLayout(_hrow(lbl("Notify on session end", sz=12, col=T2), ns_sw))
+        root.addSpacing(8)
+
+        test_wh_btn = QPushButton("Send test message")
+        test_wh_btn.setObjectName("action")
+        test_wh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        test_wh_btn.clicked.connect(lambda: self._send_discord_summary(test=True))
+        twh_row = QHBoxLayout(); twh_row.setContentsMargins(0, 0, 0, 0)
+        twh_row.addStretch(); twh_row.addWidget(test_wh_btn)
+        root.addLayout(twh_row)
 
         root.addStretch()
         return inner
@@ -1210,7 +1542,7 @@ class Plugin(PluginBase):
     def _build_stats(self):
         inner = QWidget()
         root = QVBoxLayout(inner)
-        root.setContentsMargins(0, 8, 0, 8)
+        root.setContentsMargins(0, 8, 16, 16)
         root.setSpacing(0)
 
         self._stats_widgets: dict = {}   # field name → QLabel
@@ -1271,11 +1603,20 @@ class Plugin(PluginBase):
         root.addSpacing(12)
 
         rst_btn = QPushButton("Reset Lifetime Stats")
-        rst_btn.setObjectName("badge")
+        rst_btn.setObjectName("action")
         rst_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        rst_btn.setFixedWidth(180)
-        rst_row = QHBoxLayout(); rst_row.addStretch(); rst_row.addWidget(rst_btn)
+        rst_row = QHBoxLayout()
+        rst_row.setContentsMargins(0, 0, 0, 0)
+        rst_row.addStretch()
+        rst_row.addWidget(rst_btn)
         root.addLayout(rst_row)
+        root.addSpacing(14)
+
+        # sparkline of recent session rates
+        root.addWidget(lbl("Rate / hr — last sessions", sz=10, col=T3))
+        root.addSpacing(4)
+        self._sparkline = _Sparkline()
+        root.addWidget(self._sparkline)
         root.addSpacing(16)
         root.addWidget(sep())
         root.addSpacing(14)
@@ -1298,10 +1639,9 @@ class Plugin(PluginBase):
         root.addSpacing(14)
 
         # ── HISTORY ──────────────────────────────────────────────────────────
-        clr_btn = QPushButton("Clear")
-        clr_btn.setObjectName("badge")
+        clr_btn = QPushButton("Clear History")
+        clr_btn.setObjectName("action")
         clr_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        clr_btn.setFixedWidth(64)
         sh_hdr = QHBoxLayout()
         sh_hdr.setContentsMargins(0, 0, 0, 0)
         sh_hdr.addWidget(section_header("Session History"))
@@ -1359,13 +1699,21 @@ class Plugin(PluginBase):
                 aborts = int(entry.get("aborts", 0))
                 attempts = rounds + aborts
                 succ = (rounds / attempts * 100) if attempts else 0.0
-                hist_v.addWidget(hist_row(
+                row = hist_row(
                     lbl(entry.get("date", ""),                        sz=11, col=T2),
                     lbl(str(rounds),                                  sz=11, col=T1, bold=True),
                     lbl(_fmt_time(entry.get("runtime_s", 0)),         sz=11, col=T2),
                     lbl(f"{entry.get('rate_per_hr', 0.0):.1f}",       sz=11, col=T2),
                     lbl(f"{succ:.0f}%",                               sz=11, col=T2),
-                ))
+                )
+                # make row clickable → open drilldown dialog
+                row.setCursor(Qt.CursorShape.PointingHandCursor)
+                row.setStyleSheet(
+                    "QWidget:hover { background:rgba(255,255,255,8); }"
+                )
+                row.mousePressEvent = (
+                    lambda ev, e=entry: self._show_session_detail(e))
+                hist_v.addWidget(row)
 
         def _refresh_stats():
             s = cfg.get("stats", {}) or {}
@@ -1421,6 +1769,11 @@ class Plugin(PluginBase):
                           "ls_runtime", "ls_rate", "ls_fastest", "ls_success"):
                     w[k].setText("—")
 
+            # sparkline data — last 30 sessions' rate/hr
+            if self._sparkline:
+                vals = [float(e.get("rate_per_hr", 0.0)) for e in hist]
+                self._sparkline.set_values(vals)
+
             _rebuild_history()
 
         def _reset_lifetime():
@@ -1456,8 +1809,19 @@ class Plugin(PluginBase):
     def _build_hotkeys(self):
         page = QWidget()
         root = QVBoxLayout(page)
-        root.setContentsMargins(0, 4, 0, 8)
+        root.setContentsMargins(0, 4, 16, 8)
         root.setSpacing(0)
+
+        # conflict warning bar — hidden when no clashes
+        self._hk_warn_lbl = lbl("", sz=11, col=RED, wrap=True)
+        self._hk_warn_lbl.setStyleSheet(
+            f"color:{RED}; background:rgba(248,113,113,15);"
+            " border:1px solid rgba(248,113,113,80);"
+            " border-radius:4px; padding:6px 10px;"
+        )
+        self._hk_warn_lbl.hide()
+        root.addWidget(self._hk_warn_lbl)
+        root.addSpacing(4)
 
         for name, label, _abbr in self._HOTKEYS:
             key_str, enabled = _get_hk(name)
@@ -1465,6 +1829,10 @@ class Plugin(PluginBase):
             root.addSpacing(10)
 
             row = QHBoxLayout(); row.setSpacing(10)
+            dot = _PulseDot()
+            dot.setToolTip("Lights up when this hotkey fires")
+            self._hk_dots[name] = dot
+            row.addWidget(dot)
             row.addWidget(lbl(label, sz=12, col=T2))
             row.addStretch()
 
@@ -1483,6 +1851,7 @@ class Plugin(PluginBase):
                 _set_hk(n, enabled=v)
                 self._start_listener()    # rebuild listener mapping
                 self._refresh_dashboard()
+                self._refresh_hk_conflicts()
             sw.toggled.connect(_on_enable)
             row.addWidget(sw)
 
@@ -1491,6 +1860,7 @@ class Plugin(PluginBase):
 
         root.addWidget(sep())
         root.addStretch()
+        self._refresh_hk_conflicts()
         return page
 
     # ── pickers ───────────────────────────────────────────────────────────────
@@ -1540,7 +1910,268 @@ class Plugin(PluginBase):
             _save(cfg)
             self._refresh_color_list()
             self._refresh_dashboard()
+            self._show_color_match_feedback(r, g, b)
         self._active_overlay = ColorPickerOverlay(None, cb)
+
+    # ── color match feedback (shown briefly under colour list) ───────────────
+
+    def _show_color_match_feedback(self, r: int, g: int, b: int):
+        if self._color_feedback is None:
+            return
+        rg = cfg.get("region", {}) or {}
+        if not rg.get("width") or not rg.get("height"):
+            self._color_feedback.setText(
+                f"Picked #{r:02X}{g:02X}{b:02X} — region not set, "
+                "can't preview match.")
+            self._color_feedback.setStyleSheet(f"color:{AMBER};")
+        else:
+            try:
+                tol = int(cfg.get("color_tolerance", 10))
+                img = capture_region(rg)
+                mask = build_color_mask(img, [{"r": r, "g": g, "b": b}], tol)
+                count = int(mask.sum())
+                total = int(mask.size)
+                pct = (count / total * 100) if total else 0.0
+                if count == 0:
+                    msg = (f"Picked #{r:02X}{g:02X}{b:02X} — 0 pixels match "
+                           "in region. Try a more saturated pixel or raise tolerance.")
+                    color = RED
+                elif pct > 25:
+                    msg = (f"Picked #{r:02X}{g:02X}{b:02X} — {count} px match "
+                           f"({pct:.1f}%). Looks high — may include background.")
+                    color = AMBER
+                else:
+                    msg = (f"Picked #{r:02X}{g:02X}{b:02X} — {count} px match "
+                           f"({pct:.1f}% of region).")
+                    color = GREEN
+                self._color_feedback.setText(msg)
+                self._color_feedback.setStyleSheet(f"color:{color};")
+            except Exception as e:
+                self._color_feedback.setText(f"Match preview failed: {e}")
+                self._color_feedback.setStyleSheet(f"color:{T3};")
+        self._color_feedback.show()
+        if self._color_fb_timer is None:
+            self._color_fb_timer = QTimer()
+            self._color_fb_timer.setSingleShot(True)
+            self._color_fb_timer.timeout.connect(
+                lambda: self._color_feedback and self._color_feedback.hide())
+        self._color_fb_timer.start(8000)
+
+    # ── session detail drilldown ──────────────────────────────────────────────
+
+    def _show_session_detail(self, entry: dict):
+        dlg = QDialog()
+        dlg.setWindowTitle("Session details")
+        dlg.setStyleSheet(
+            "QDialog { background:#0f0f0f; }"
+            "QLabel  { background:transparent; color:#e5e7eb; }"
+        )
+        dlg.setMinimumWidth(360)
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(20, 18, 20, 18); v.setSpacing(8)
+
+        rounds   = int(entry.get("rounds", 0))
+        aborts   = int(entry.get("aborts", 0))
+        clicks   = int(entry.get("clicks", 0))
+        runtime  = float(entry.get("runtime_s", 0.0))
+        rate     = float(entry.get("rate_per_hr", 0.0))
+        fastest  = float(entry.get("fastest_round_s", 0.0))
+        attempts = rounds + aborts
+        success  = (rounds / attempts * 100) if attempts else 0.0
+        avg_round = (runtime / rounds) if rounds else 0.0
+        avg_per   = (clicks / rounds) if rounds else 0.0
+
+        v.addWidget(lbl(str(entry.get("date", "")),
+                        sz=14, col=T1, bold=True))
+        v.addSpacing(10)
+
+        rows = [
+            ("Rounds completed",  str(rounds)),
+            ("Aborted attempts",  str(aborts)),
+            ("Total clicks",      str(clicks)),
+            ("Runtime",           _fmt_time(runtime)),
+            ("Rate / hr",         f"{rate:.1f}"),
+            ("Success rate",      f"{success:.0f}%" if attempts else "—"),
+            ("Avg round duration", f"{avg_round:.2f} s" if rounds else "—"),
+            ("Avg clicks / round", f"{avg_per:.1f}" if rounds else "—"),
+            ("Fastest round",     f"{fastest:.2f} s" if fastest > 0 else "—"),
+        ]
+        for k, val in rows:
+            r = QHBoxLayout(); r.setSpacing(0)
+            r.addWidget(lbl(k, sz=12, col=T2))
+            r.addStretch()
+            r.addWidget(lbl(val, sz=12, col=T1, bold=True))
+            v.addLayout(r)
+            v.addSpacing(2)
+
+        v.addSpacing(14)
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("action")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(dlg.accept)
+        cr = QHBoxLayout(); cr.addStretch(); cr.addWidget(close_btn)
+        v.addLayout(cr)
+
+        dlg.exec()
+
+    # ── first-run wizard ──────────────────────────────────────────────────────
+
+    def _maybe_show_wizard(self):
+        """Show setup wizard once per plugin load if nothing is configured."""
+        if self._wizard_shown:
+            return
+        wp = cfg.get("wait_point", {}) or {}
+        rg = cfg.get("region", {}) or {}
+        colors = cfg.get("target_colors", [])
+        if (wp.get("x") or wp.get("y")) or rg.get("width") or colors:
+            return
+        self._wizard_shown = True
+        QTimer.singleShot(400, self._show_wizard)   # delay so hub is rendered
+
+    def _show_wizard(self):
+        dlg = QDialog()
+        dlg.setWindowTitle("Magnet Minigame — Setup")
+        dlg.setStyleSheet(
+            "QDialog { background:#0f0f0f; }"
+            "QLabel  { background:transparent; color:#e5e7eb; }"
+        )
+        dlg.setMinimumWidth(420)
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(22, 20, 22, 20); v.setSpacing(10)
+
+        v.addWidget(lbl("Welcome — let's set this up", sz=15, col=T1, bold=True))
+        v.addSpacing(2)
+        v.addWidget(lbl(
+            "Three quick steps. Each one will dim the screen and let you "
+            "click. Press Esc inside an overlay to cancel a single step.",
+            sz=11, col=T3, wrap=True))
+        v.addSpacing(14)
+
+        steps = [
+            ("1.  Pick a wait point",
+             "Where the cursor parks during the minigame. Anywhere outside "
+             "the icon area works.",
+             "select_wait"),
+            ("2.  Drag the region",
+             "Box around where the icons appear. A bit of margin is fine.",
+             "select_region"),
+            ("3.  Pick a color",
+             "Click the PURPLE body of any icon — not the blue ring. "
+             "Tolerance 10 is the default.",
+             "select_color"),
+        ]
+
+        step_btns: list[tuple[QPushButton, str, callable]] = []
+
+        def _is_done(action: str) -> bool:
+            if action == "select_wait":
+                wp = cfg.get("wait_point", {}) or {}
+                return bool(wp.get("x") or wp.get("y"))
+            if action == "select_region":
+                rg = cfg.get("region", {}) or {}
+                return bool(rg.get("width") and rg.get("height"))
+            if action == "select_color":
+                return bool(cfg.get("target_colors"))
+            return False
+
+        def _refresh_buttons():
+            for btn, action, _ in step_btns:
+                done = _is_done(action)
+                btn.setText("✓ Done" if done else "Set")
+                btn.setEnabled(not done)
+                btn.setStyleSheet(
+                    "color:#4ade80; border-color:#16a34a;" if done else "")
+
+        for title, desc, action in steps:
+            row = QVBoxLayout(); row.setSpacing(2)
+            row.addWidget(lbl(title, sz=13, col=T1, bold=True))
+            row.addWidget(lbl(desc, sz=10, col=T3, wrap=True))
+            br = QHBoxLayout(); br.setContentsMargins(0, 4, 0, 0)
+            btn = QPushButton("Set")
+            btn.setObjectName("action")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            br.addStretch(); br.addWidget(btn)
+            row.addLayout(br)
+            v.addLayout(row)
+            v.addSpacing(10)
+            step_btns.append((btn, action, None))
+
+        # Wire each step button to spawn the corresponding picker.
+        # Hide the dialog so the picker overlay is the only thing on screen.
+        def _do_step(action: str):
+            dlg.hide()
+            handler = {
+                "select_wait":   self._do_pick_wait,
+                "select_region": self._do_pick_region,
+                "select_color":  self._do_pick_color,
+            }[action]
+            handler()
+            # poll until picker closes, then re-show wizard
+            poll = QTimer(dlg)
+            def _check():
+                if self._active_overlay is None:
+                    poll.stop()
+                    _refresh_buttons()
+                    if all(_is_done(a) for _, a, _ in step_btns):
+                        QTimer.singleShot(300, dlg.accept)
+                    else:
+                        dlg.show()
+            poll.timeout.connect(_check)
+            poll.start(150)
+
+        for btn, action, _ in step_btns:
+            btn.clicked.connect(lambda _=None, a=action: _do_step(a))
+
+        # footer
+        v.addSpacing(6)
+        skip_btn = QPushButton("Skip — I'll configure manually")
+        skip_btn.setObjectName("action")
+        skip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        skip_btn.clicked.connect(dlg.reject)
+        fr = QHBoxLayout(); fr.addStretch(); fr.addWidget(skip_btn)
+        v.addLayout(fr)
+
+        _refresh_buttons()
+        dlg.exec()
+
+    # ── Test Detection ────────────────────────────────────────────────────────
+
+    def _do_test_detection(self):
+        if self._test_lbl is None:
+            return
+        rg = cfg.get("region", {}) or {}
+        colors = cfg.get("target_colors", [])
+        if not rg.get("width") or not rg.get("height"):
+            self._test_lbl.setText("⚠ region not set")
+            self._test_lbl.setStyleSheet(f"color:{AMBER};")
+            return
+        if not colors:
+            self._test_lbl.setText("⚠ no target colors set")
+            self._test_lbl.setStyleSheet(f"color:{AMBER};")
+            return
+        try:
+            tol    = int(cfg.get("color_tolerance", 10))
+            min_px = int(cfg.get("min_cluster_px", 30))
+            t0 = time.monotonic()
+            img = capture_region(rg)
+            mask = build_color_mask(img, colors, tol)
+            centers = _find_components(mask, min_px)
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            matched = int(mask.sum())
+            n = len(centers)
+            if n == 0:
+                msg = (f"No clusters detected. {matched} pixels matched. "
+                       f"Try lowering Min Cluster Pixels or raising tolerance.")
+                color = RED if matched == 0 else AMBER
+            else:
+                msg = (f"{n} cluster{'s' if n != 1 else ''} detected, "
+                       f"{matched} matching px, scan {elapsed_ms:.1f} ms")
+                color = GREEN
+            self._test_lbl.setText(msg)
+            self._test_lbl.setStyleSheet(f"color:{color};")
+        except Exception as e:
+            self._test_lbl.setText(f"Test failed: {e}")
+            self._test_lbl.setStyleSheet(f"color:{RED};")
 
     # ── hotkey actions ────────────────────────────────────────────────────────
 
@@ -1583,6 +2214,8 @@ class Plugin(PluginBase):
         state.session_clicks     = 0
         state.fastest_round_s    = None
         state.last_round_s       = None
+        state.streak             = 0
+        state.last_stopped_at    = None
 
     def _end_session(self):
         self._commit_session()
@@ -1590,6 +2223,9 @@ class Plugin(PluginBase):
         state.paused             = False
         state.session_start      = None
         state.session_started_at = None
+        state.last_stopped_at    = time.monotonic()
+        # fire-and-forget Discord webhook on session end
+        self._send_discord_summary()
 
     def _commit_session(self):
         """Persist the current session into stats. No-op for empty sessions."""
@@ -1636,6 +2272,89 @@ class Plugin(PluginBase):
         s["session_history"] = history
         _save(cfg)
 
+    # ── Discord webhook ───────────────────────────────────────────────────────
+
+    def _send_discord_summary(self, test: bool = False):
+        url = (cfg.get("discord_webhook_url") or "").strip()
+        if not url:
+            return
+        if not test and not cfg.get("discord_notify_end", False):
+            return
+
+        if test:
+            content = "🔧 **Magnet Minigame** — Webhook test successful."
+        else:
+            hist = cfg.get("stats", {}).get("session_history", [])
+            if not hist:
+                return
+            last = hist[-1]
+            rounds = int(last.get("rounds", 0))
+            aborts = int(last.get("aborts", 0))
+            clicks = int(last.get("clicks", 0))
+            attempts = rounds + aborts
+            success = (rounds / attempts * 100) if attempts else 0.0
+            rt = float(last.get("runtime_s", 0.0))
+            h, rem = divmod(int(rt), 3600)
+            m, s   = divmod(rem, 60)
+            rt_str = f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
+            rate = float(last.get("rate_per_hr", 0.0))
+            content = (
+                f"🧲 **Magnet Minigame** — Session ended\n"
+                f"> **{rounds}** rounds  ·  **{clicks}** clicks  "
+                f"·  {rt_str} runtime  ·  {rate:.1f} / hr\n"
+                f"> Success: **{success:.0f}%**  ·  Aborts: {aborts}"
+            )
+
+        def _post():
+            try:
+                data = json.dumps({"content": content}).encode()
+                req = urllib.request.Request(
+                    url, data=data,
+                    headers={"Content-Type": "application/json"},
+                )
+                urllib.request.urlopen(req, timeout=8)
+            except Exception:
+                pass
+        threading.Thread(target=_post, daemon=True).start()
+
+    # ── live hotkey indicator ─────────────────────────────────────────────────
+
+    def _on_hk_fired(self, name: str):
+        dot = self._hk_dots.get(name)
+        if dot:
+            dot.pulse()
+
+    # ── hotkey conflict detection ─────────────────────────────────────────────
+
+    def _refresh_hk_conflicts(self):
+        """Highlight badges whose key clashes with another enabled hotkey."""
+        seen: dict[str, list[str]] = {}
+        for name, _l, _a in self._HOTKEYS:
+            k, en = _get_hk(name)
+            if not en or not k:
+                continue
+            seen.setdefault(k.lower(), []).append(name)
+        clashed = {n for keys in seen.values() if len(keys) > 1 for n in keys}
+
+        for name, badge in self._badges.items():
+            is_clash = name in clashed
+            badge.setProperty("clash", is_clash)
+            badge.setStyleSheet(
+                "QPushButton#badge[clash=true]{ "
+                "border-color:#f87171; color:#f87171; }"
+                if is_clash else ""
+            )
+            badge.style().unpolish(badge); badge.style().polish(badge)
+
+        if self._hk_warn_lbl:
+            if clashed:
+                names = ", ".join(sorted(clashed))
+                self._hk_warn_lbl.setText(
+                    f"⚠ {len(clashed)} hotkeys share the same key: {names}")
+                self._hk_warn_lbl.show()
+            else:
+                self._hk_warn_lbl.hide()
+
     # ── persistent hotkey listener ────────────────────────────────────────────
 
     def _start_listener(self):
@@ -1656,7 +2375,7 @@ class Plugin(PluginBase):
         ):
             k, en = _get_hk(name)
             if en and k:
-                sig_map[k.lower()] = signal
+                sig_map[k.lower()] = (name, signal)
 
         def _key_str(key) -> str:
             try:
@@ -1675,8 +2394,10 @@ class Plugin(PluginBase):
             if self._capturing_for:
                 self._apply_rebind(ks)
                 return
-            sig = sig_map.get(ks)
-            if sig:
+            entry = sig_map.get(ks)
+            if entry:
+                name, sig = entry
+                _bridge.hk_fired.emit(name)
                 sig.emit()
 
         try:
@@ -1727,6 +2448,7 @@ class Plugin(PluginBase):
                 badge.style().unpolish(badge); badge.style().polish(badge)
             self._start_listener()
             self._refresh_dashboard()
+            self._refresh_hk_conflicts()
 
         QTimer.singleShot(0, apply)
 
@@ -1768,7 +2490,19 @@ class Plugin(PluginBase):
             ov.show()
 
         if ov._move_mode:
+            ov.setWindowOpacity(1.0)
             return  # move mode owns its own display
+
+        # auto-fade after 30 s of being stopped (only if bot was actually run)
+        if state.enabled or state.last_stopped_at is None:
+            ov.setWindowOpacity(1.0)
+        else:
+            stopped_for = time.monotonic() - state.last_stopped_at
+            if stopped_for > 30:
+                t = max(0.0, min(1.0, (stopped_for - 30) / 5.0))
+                ov.setWindowOpacity(1.0 - 0.65 * t)
+            else:
+                ov.setWindowOpacity(1.0)
 
         # ── status text + colour ──────────────────────────────────────────────
         if not state.enabled:
