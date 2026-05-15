@@ -113,6 +113,83 @@ class Plugin(PluginBase):
     TAGS        = ["FiveM"]            # chips on the card
     VERSION     = "1.0"
 
+    # Game targeting — what window/process this plugin watches for focus
+    # auto-pause and "is the game running" warnings.
+    #   GAME_NAME      → friendly name shown in the UI
+    #   GAME_PROCESSES → list of substrings to match against the focused
+    #                    window's process name (case-insensitive).
+    # Replace with whatever game your plugin targets. Examples:
+    #   ("Minecraft",       ["javaw", "minecraft"])
+    #   ("Rust",            ["rustclient"])
+    #   ("World of Warcraft", ["wow.exe"])
+    #   ("Cyberpunk 2077",  ["cyberpunk2077"])
+    GAME_NAME      = "FiveM"
+    GAME_PROCESSES = ["fivem", "gta"]
+
+    # Optional — small icon shown next to the plugin name on the hub card.
+    # Path is relative to plugins/ or the hub exe. Any PIL-readable format.
+    # GAME_ICON_PATH = "icons/fivem.png"
+
+    # Optional — fires when the user clicks the ▶ button on the hub card.
+    # String:  "C:/Games/Steam/steam.exe -applaunch 271590"  (parsed as shell)
+    # OR list: ["C:/Games/Steam/steam.exe", "-applaunch", "271590"]
+    # OR a single path: "C:/Games/MyGame.exe"
+    # GAME_LAUNCH_CMD = None
+
+    # Optional — when True, the hub card is dimmed and unclickable while the
+    # target game isn't running. The dashboard FiveM warning chip continues
+    # to work whether this is set or not.
+    GAME_REQUIRED  = False
+
+    # Required for hub Export/Import — path to this plugin's config file,
+    # relative to cfg/ (or absolute). Set to None to disable the right-click
+    # Export/Import menu items.
+    CONFIG_PATH    = "myplugin_config.json"
+
+    # ── optional: hub-level panic hotkey subscriptions ────────────────────────
+    # The hub installs "ctrl+shift+s/p/r" by default (configurable in
+    # hub_settings.json) which publish:
+    #     hub.stop_all   — every plugin should stop
+    #     hub.pause_all  — every plugin should pause
+    #     hub.resume_all — every plugin should resume
+    # In your plugin's __init__:
+    #
+    #     from hub_sdk import pubsub
+    #     self._pubsub_unsubs = [
+    #         pubsub.subscribe("hub.stop_all", lambda _p: self._stop()),
+    #     ]
+    # And in on_unload, call each unsub() to detach.
+
+    # ── optional: schedule (run windows) ──────────────────────────────────────
+    #     from hub_sdk import is_in_window
+    #     if not is_in_window("08:00", "22:00", ["mon", "tue", "wed", ...]):
+    #         time.sleep(1.0); continue   # idle until inside the window
+
+    # ── optional: mini-dashboard contribution ─────────────────────────────────
+    # The hub mini-overlay calls plugin.status() to render one row per plugin
+    # so the default status() return value is already enough. No extra code
+    # required.
+
+    # ── required: gate hotkeys + worker to the plugin page ────────────────────
+    # By convention all plugins ONLY operate while their own card is selected
+    # in the hub. Use is_plugin_active() everywhere a hotkey fires or your
+    # worker decides to do work:
+    #
+    #     from hub_sdk import is_plugin_active
+    #     _PLUGIN_NAME = "My Plugin"   # match Plugin.NAME exactly
+    #
+    #     # Worker loop:
+    #     if not is_plugin_active(_PLUGIN_NAME):
+    #         time.sleep(0.2); continue
+    #
+    #     # Listener on_press:
+    #     if not is_plugin_active(_PLUGIN_NAME):
+    #         return
+    #
+    # Hub-level panic hotkeys (Ctrl+Shift+S/P/R by default) bypass this gate
+    # via pubsub topics ("hub.stop_all", etc.) so the user can stop anything
+    # from anywhere.
+
     def __init__(self):
         self._hk_gen    = 0
         self._capturing = False

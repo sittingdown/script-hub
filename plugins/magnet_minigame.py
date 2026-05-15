@@ -34,12 +34,14 @@ from hub_sdk import (
     make_tabs, scrollable,
     ToggleSwitch, NumericStepper, ColorSwatch,
     is_plugin_active,
+    pubsub,
+    is_in_window,
 )
 from overlays_qt import (
     RegionSelectorOverlay, PointSelectorOverlay, ColorPickerOverlay,
 )
 from detector import capture_region, build_color_mask
-from bot import is_fivem_focused, get_fivem_status
+from bot import is_process_focused, is_process_running
 import numpy as np
 
 # Optional scipy fast-path for pixel-level connected components.
@@ -107,6 +109,14 @@ _DEF = {
 
     "discord_webhook_url":  "",
     "discord_notify_end":   False,
+
+    # Schedule — when enabled, the worker idles outside the configured
+    # window/days. Defaults to "any time" so it's effectively a no-op
+    # until the user turns it on.
+    "schedule_enabled":   False,
+    "schedule_start":     "00:00",
+    "schedule_end":       "23:59",
+    "schedule_days":      ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
 
     "stats": {
         "lifetime_rounds":    0,
@@ -371,13 +381,20 @@ class _Worker:
         return True
 
     def _continue(self) -> bool:
-        return self._running and state.enabled and not state.paused and (
-            (not cfg.get("auto_pause_unfocused", True)) or state.focused
-        )
+        return (self._running
+                and state.enabled
+                and not state.paused
+                and ((not cfg.get("auto_pause_unfocused", True)) or state.focused)
+                and is_plugin_active(_PLUGIN_NAME))
 
     def _do_food_drink_break(self) -> bool:
         """
-        Press eat key, press drink key, then sleep for the configured duration.
+        Press eat, wait out the eat animation, press drink, wait out the
+        drink animation. The configured ``fd_duration_s`` is split evenly
+        between the two consumes so each one actually gets its own
+        animation window — otherwise FiveM swallows the second press while
+        the first is still animating, which was the "only one happens" bug.
+
         Updates ``state.last_break_at`` and ``state.breaks_done`` on success.
         Returns False if the break was interrupted (stopped/paused), so the
         worker loop knows to re-evaluate.
@@ -400,17 +417,18 @@ class _Worker:
         if not self._continue():
             return False
 
-        # Press the consume keys, in order, with a small pause between
-        keys = (eat_key, drink_key) if eat_first else (drink_key, eat_key)
-        for k in keys:
+        # Press each consume key once and give its animation a real window
+        # before moving on. Floor of 1.0s per key so even a short duration
+        # leaves room for FiveM to register the second press.
+        keys   = (eat_key, drink_key) if eat_first else (drink_key, eat_key)
+        labels = ("eating…", "drinking…") if eat_first else ("drinking…", "eating…")
+        per_key = max(1.0, duration / 2.0)
+
+        for k, label in zip(keys, labels):
             if not self._continue():
                 return False
             _press_key(k, hold=0.06)
-            time.sleep(0.25)
-            _press_key(k, hold=0.06)
-
-        # Wait out the consume animations (cooldown bar fills during the wait)
-        self._cd_sleep(duration, "food / drink break")
+            self._cd_sleep(per_key, label)
 
         if not self._continue():
             return False
@@ -485,6 +503,25 @@ class _Worker:
                     _bridge.update.emit()
                     time.sleep(0.1)
                     continue
+
+                # ── ONLY RUN WHILE THE PLUGIN'S CARD IS SELECTED ─────────────
+                if not is_plugin_active(_PLUGIN_NAME):
+                    state.phase = "INACTIVE"
+                    _bridge.update.emit()
+                    time.sleep(0.2)
+                    continue
+
+                # ── SCHEDULE GATE ─────────────────────────────────────────────
+                if cfg.get("schedule_enabled", False):
+                    if not is_in_window(
+                        cfg.get("schedule_start", "00:00"),
+                        cfg.get("schedule_end",   "23:59"),
+                        cfg.get("schedule_days", []) or None,
+                    ):
+                        state.phase = "SCHED_WAIT"
+                        _bridge.update.emit()
+                        time.sleep(1.0)
+                        continue
 
                 # ── FOOD / DRINK BREAK ────────────────────────────────────────
                 if cfg.get("fd_break_enabled", False):
@@ -729,12 +766,19 @@ def _hrow(*widgets):
             h.addStretch()
     return h
 
+# Module-level name of THIS plugin. Used to gate hotkeys + worker via
+# is_plugin_active() so the bot only operates while its card is selected
+# in the hub.
+_PLUGIN_NAME = "Magnet Minigame"
+
 _PHASE_TEXT = {
     "PRESS_E":     ("PRESSING E",  GREEN),
     "PARK":        ("PARKING",     GREEN),
     "SCAN":        ("SCANNING",    GREEN),
     "COOLDOWN":    ("COOLDOWN",    BLUE),
     "BREAK":       ("FOOD / DRINK BREAK", BLUE),
+    "SCHED_WAIT":  ("OUT OF SCHEDULE", AMBER),
+    "INACTIVE":    ("INACTIVE — open this plugin to run", T3),
     "NEEDS_SETUP": ("NEEDS SETUP", RED),
     "UNFOCUSED":   ("UNFOCUSED",   AMBER),
     "PAUSED":      ("PAUSED",      AMBER),
@@ -1140,6 +1184,16 @@ class Plugin(PluginBase):
     TAGS        = ["FiveM", "Minigame"]
     VERSION     = "1.0"
 
+    # Game-targeting (read by focus/auto-pause logic). Change these in any
+    # plugin to target a different game.
+    #   GAME_NAME      — friendly display name shown in the UI
+    #   GAME_PROCESSES — list of process-name / window-title substrings to
+    #                    match (case-insensitive). The first hit wins.
+    GAME_NAME      = "FiveM"
+    GAME_PROCESSES = ["fivem", "gta"]
+    # Required for hub Export/Import — path relative to cfg/
+    CONFIG_PATH    = "magnet_minigame_config.json"
+
     _HOTKEYS = [
         ("toggle",         "Toggle Bot",          "Toggle"),
         ("pause",           "Pause / Resume",     "Pause"),
@@ -1189,6 +1243,18 @@ class Plugin(PluginBase):
         _bridge.hk_select_region.connect(self._guarded("select_region", self._do_pick_region))
         _bridge.hk_select_color.connect(self._guarded("select_color",  self._do_pick_color))
         _bridge.hk_fired.connect(self._on_hk_fired)
+
+        # ── Hub-level panic hotkey subscriptions ───────────────────────────────
+        # Cross-plugin coordination: any plugin that publishes "hub.stop_all"
+        # (the hub's own panic hotkey, but other plugins could too) stops us.
+        self._pubsub_unsubs = [
+            pubsub.subscribe("hub.stop_all",   lambda _p: QTimer.singleShot(
+                0, self._do_emergency_stop)),
+            pubsub.subscribe("hub.pause_all",  lambda _p: QTimer.singleShot(
+                0, self._on_external_pause)),
+            pubsub.subscribe("hub.resume_all", lambda _p: QTimer.singleShot(
+                0, self._on_external_resume)),
+        ]
 
         # ── Status overlay — lives for the plugin's lifetime ───────────────────
         self._overlay = _StatusOverlay()
@@ -1241,8 +1307,9 @@ class Plugin(PluginBase):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # FiveM-not-running warning chip (hidden when running)
-        self._fivem_warn = lbl("⚠ FiveM is not running", sz=11, col=AMBER,
+        # Game-not-running warning chip (hidden when running)
+        self._fivem_warn = lbl(f"⚠ {self.GAME_NAME} is not running",
+                               sz=11, col=AMBER,
                                align=Qt.AlignmentFlag.AlignCenter)
         self._fivem_warn.setStyleSheet(
             f"color:{AMBER}; background:rgba(251,191,36,15);"
@@ -1396,13 +1463,13 @@ class Plugin(PluginBase):
         unfocus_paused = (cfg.get("auto_pause_unfocused", True)
                           and not state.focused)
 
-        # FiveM-not-running warning
+        # Game-not-running warning
         if self._fivem_warn:
             try:
-                fivem_running, _ = get_fivem_status()
+                game_running = is_process_running(self.GAME_PROCESSES)
             except Exception:
-                fivem_running = True
-            self._fivem_warn.setVisible(not fivem_running)
+                game_running = True
+            self._fivem_warn.setVisible(not game_running)
 
         # Streak chip
         if self._streak_lbl:
@@ -1417,7 +1484,7 @@ class Plugin(PluginBase):
                 pk, _ = _get_hk("pause")
                 d["state"].setText(f"PAUSED — press {pk.upper()} to resume")
             else:
-                d["state"].setText("PAUSED — focus FiveM")
+                d["state"].setText(f"PAUSED — focus {self.GAME_NAME}")
             d["state"].setStyleSheet(
                 f"color:{AMBER}; font-size:22px; font-weight:700; background:transparent;")
         elif running:
@@ -1721,7 +1788,8 @@ class Plugin(PluginBase):
         sw = ToggleSwitch(cfg.get("auto_pause_unfocused", True))
         sw.toggled.connect(lambda v: (cfg.update({"auto_pause_unfocused": v}),
                                       _save(cfg)))
-        root.addLayout(_hrow(lbl("Auto-pause when unfocused", sz=12, col=T2), sw))
+        root.addLayout(_hrow(lbl(f"Auto-pause when {self.GAME_NAME} unfocused",
+                                  sz=12, col=T2), sw))
         root.addSpacing(20)
 
         # ── Food / Drink Break ────────────────────────────────────────────────
@@ -1785,6 +1853,74 @@ class Plugin(PluginBase):
         ef.setToolTip("If on, eat then drink. If off, drink then eat.")
         ef.toggled.connect(lambda v: (cfg.update({"fd_eat_first": v}), _save(cfg)))
         root.addLayout(_hrow(lbl("Eat before drink", sz=12, col=T2), ef))
+        root.addSpacing(20)
+
+        # ── Schedule ──────────────────────────────────────────────────────────
+        root.addWidget(section_header("Schedule"))
+        root.addSpacing(6)
+        root.addWidget(lbl(
+            "Restrict the bot to a time window. Outside the window it idles "
+            "with status 'OUT OF SCHEDULE'. Use overnight ranges by setting "
+            "start > end (e.g. 22:00 → 04:00).",
+            sz=10, col=T3, wrap=True))
+        root.addSpacing(10)
+
+        sch_sw = ToggleSwitch(bool(cfg.get("schedule_enabled", False)))
+        sch_sw.toggled.connect(
+            lambda v: (cfg.update({"schedule_enabled": v}), _save(cfg)))
+        root.addLayout(_hrow(lbl("Enable schedule", sz=12, col=T2), sch_sw))
+        root.addSpacing(8)
+
+        # Start / end time as plain QLineEdit (HH:MM)
+        s_edit = QLineEdit(str(cfg.get("schedule_start", "00:00")))
+        e_edit = QLineEdit(str(cfg.get("schedule_end",   "23:59")))
+        for ed in (s_edit, e_edit):
+            ed.setFixedWidth(70)
+            ed.setMaxLength(5)
+            ed.setStyleSheet(
+                "QLineEdit { background:#0f0f0f; border:1px solid #2a2a2a;"
+                " border-radius:4px; padding:3px 6px; color:#e5e7eb;"
+                " font-size:11px; }"
+                "QLineEdit:focus { border-color:#3a3a3a; }"
+            )
+        s_edit.editingFinished.connect(
+            lambda: (cfg.update({"schedule_start": s_edit.text().strip()}), _save(cfg)))
+        e_edit.editingFinished.connect(
+            lambda: (cfg.update({"schedule_end": e_edit.text().strip()}), _save(cfg)))
+        time_row = QHBoxLayout(); time_row.setContentsMargins(0, 0, 0, 0)
+        time_row.setSpacing(6)
+        time_row.addWidget(lbl("From", sz=12, col=T2))
+        time_row.addStretch()
+        time_row.addWidget(s_edit)
+        time_row.addSpacing(8)
+        time_row.addWidget(lbl("to", sz=12, col=T2))
+        time_row.addSpacing(8)
+        time_row.addWidget(e_edit)
+        root.addLayout(time_row)
+        root.addSpacing(10)
+
+        # Day-of-week toggles
+        days_row = QHBoxLayout()
+        days_row.setContentsMargins(0, 0, 0, 0); days_row.setSpacing(8)
+        days_row.addWidget(lbl("Days", sz=12, col=T2))
+        days_row.addStretch()
+        cur_days = set(d.lower() for d in (cfg.get("schedule_days") or []))
+        for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun"):
+            btn = QPushButton(d.upper())
+            btn.setObjectName("badge")
+            btn.setCheckable(True)
+            btn.setChecked(d in cur_days)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedWidth(38)
+            def _on_day(checked, day=d):
+                cur = set(cfg.get("schedule_days") or [])
+                if checked: cur.add(day)
+                else:       cur.discard(day)
+                cfg["schedule_days"] = sorted(cur, key=("mon","tue","wed","thu","fri","sat","sun").index)
+                _save(cfg)
+            btn.toggled.connect(_on_day)
+            days_row.addWidget(btn)
+        root.addLayout(days_row)
         root.addSpacing(20)
 
         # ── Status Overlay ────────────────────────────────────────────────────
@@ -2738,6 +2874,18 @@ class Plugin(PluginBase):
             state.paused = not state.paused
             _bridge.update.emit()
 
+    def _on_external_pause(self):
+        """Called by pubsub when the hub or another plugin requests Pause All."""
+        if state.enabled and not state.paused:
+            state.paused = True
+            _bridge.update.emit()
+
+    def _on_external_resume(self):
+        """Called by pubsub when the hub or another plugin requests Resume All."""
+        if state.enabled and state.paused:
+            state.paused = False
+            _bridge.update.emit()
+
     def _do_emergency_stop(self):
         if state.enabled:
             self._end_session()
@@ -2882,11 +3030,15 @@ class Plugin(PluginBase):
     # ── enable-state guard wrapper ────────────────────────────────────────────
 
     def _guarded(self, hk_name: str, action):
-        """Wrap an action so it only runs when its hotkey is currently enabled.
-        Use for bridge → handler connections; UI paths (wizard, settings
-        buttons) should call the underlying ``_do_*`` method directly so the
-        guard never blocks legitimate non-hotkey triggers."""
+        """Wrap an action so it only runs when its hotkey is currently
+        enabled AND this plugin is the active hub page. Defense-in-depth:
+        catches stale signals from ghost listeners AND prevents fire-by-
+        accident when the user is on the hub home or another plugin.
+        UI paths (wizard, settings buttons) should call the underlying
+        ``_do_*`` method directly to bypass these guards."""
         def runner(*_a, **_kw):
+            if not is_plugin_active(_PLUGIN_NAME):
+                return
             _, en = _get_hk(hk_name)
             if en:
                 action()
@@ -2968,8 +3120,15 @@ class Plugin(PluginBase):
             ks = _key_str(key)
             if not ks:
                 return
+            # Rebind capture wins regardless of which page is selected
+            # (the user is explicitly looking at the Hotkeys tab right now).
             if self._capturing_for:
                 self._apply_rebind(ks)
+                return
+            # Plugin hotkeys ONLY fire when this plugin's card is selected.
+            # Use the hub's panic hotkeys (Ctrl+Shift+S/P/R, configurable in
+            # cfg/hub_settings.json) for cross-plugin global controls.
+            if not is_plugin_active(_PLUGIN_NAME):
                 return
             entry = sig_map.get(ks)
             if entry:
@@ -3069,7 +3228,7 @@ class Plugin(PluginBase):
 
     def _tick(self):
         try:
-            state.focused = is_fivem_focused()
+            state.focused = is_process_focused(self.GAME_PROCESSES)
         except Exception:
             state.focused = True
 
@@ -3140,44 +3299,62 @@ class Plugin(PluginBase):
     # ── unload ────────────────────────────────────────────────────────────────
 
     def on_unload(self):
-        if state.enabled:
-            self._commit_session()
+        # NOTE: this can run on a HALF-CONSTRUCTED instance — the hub calls
+        # on_unload() even when __init__ crashed partway, so it can tear down
+        # whatever threads/listeners/timers __init__ managed to start. Every
+        # access here must tolerate the attribute simply not existing.
+        try:
+            if state.enabled:
+                self._commit_session()
+        except Exception:
+            pass
         state.enabled = False
         state.paused  = False
         state.session_start = None
         state.session_started_at = None
-        _worker.stop()
-        if self._listener:
-            old = self._listener
+
+        # Detach pubsub subscribers
+        for unsub in getattr(self, "_pubsub_unsubs", []) or []:
+            try: unsub()
+            except Exception: pass
+        self._pubsub_unsubs = []
+
+        # Worker thread (module-level singleton — always safe to stop)
+        try: _worker.stop()
+        except Exception: pass
+
+        # Keyboard listener
+        listener = getattr(self, "_listener", None)
+        if listener is not None:
             self._listener = None
-            try: old.stop()
+            try: listener.stop()
             except Exception: pass
-            # Wait for the Win32 hook thread to fully exit, otherwise the
-            # next plugin instance after a hub refresh ends up with this
-            # ghost listener still alive — which is exactly the case where
-            # disabled hotkeys keep firing because the ghost has the old
-            # sig_map cached.
-            try: old.join(timeout=1.0)
+            try: listener.join(timeout=1.0)
             except Exception: pass
-        try:
-            self._overlay_timer.stop()
-        except Exception:
-            pass
-        try:
-            if self._marker_live_timer is not None:
-                self._marker_live_timer.stop()
-        except Exception:
-            pass
-        try:
-            self._overlay.hide()
-            self._overlay.deleteLater()
-        except Exception:
-            pass
+
+        # Standalone timers
+        for attr in ("_overlay_timer", "_marker_live_timer", "_color_fb_timer"):
+            t = getattr(self, attr, None)
+            if t is not None:
+                try: t.stop()
+                except Exception: pass
+
+        # Status overlay window
+        ov = getattr(self, "_overlay", None)
+        if ov is not None:
+            try: ov.hide()
+            except Exception: pass
+            try: ov.deleteLater()
+            except Exception: pass
+
+        # Disconnect bridge signals so a ghost worker can't fire into us
         for sig in (_bridge.hk_toggle, _bridge.hk_pause, _bridge.hk_estop,
                     _bridge.hk_select_wait, _bridge.hk_select_region,
-                    _bridge.hk_select_color, _bridge.update, _bridge.cooldown):
+                    _bridge.hk_select_color, _bridge.hk_fired,
+                    _bridge.update, _bridge.cooldown):
             try: sig.disconnect()
             except Exception: pass
+
         try:
             _kbd.release(KeyCode.from_char(cfg.get("interaction_key", "e")))
         except Exception:
