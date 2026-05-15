@@ -402,3 +402,38 @@ class Plugin(PluginBase):
                 lst.join()
 
         threading.Thread(target=listen, daemon=True).start()
+
+    # ── on_unload — REQUIRED if your plugin starts threads/listeners ───────────
+
+    def on_unload(self):
+        """
+        Tear down everything __init__ / build_page started. The hub calls
+        this on Refresh and per-plugin Reload.
+
+        IMPORTANT: this may run on a HALF-CONSTRUCTED instance — if __init__
+        raised partway through, the hub still calls on_unload() to clean up
+        whatever already started. So every attribute access must tolerate
+        the attribute not existing. Use getattr() and per-step try/except.
+
+        A plugin that leaks threads/listeners here can hard-crash the next
+        hub refresh when the orphan touches a deleted Qt widget.
+        """
+        # Stop the hotkey poll thread (generation counter kills its loop)
+        try:
+            self._hk_gen = getattr(self, "_hk_gen", 0) + 1
+        except Exception:
+            pass
+
+        # Stop the worker
+        try:
+            _worker.stop()
+        except Exception:
+            pass
+
+        # Disconnect bridge signals so a lingering thread can't fire into
+        # widgets that are about to be deleted
+        for sig in (_bridge.update, _bridge.toggle):
+            try:
+                sig.disconnect()
+            except Exception:
+                pass
