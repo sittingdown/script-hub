@@ -44,6 +44,91 @@ class Plugin(PluginBase):
     TAGS        = ["FiveM", "Input"] # small chips on the card
     VERSION     = "1.0"              # informational only
 
+    # ── game targeting (any game — not just FiveM) ────────────────────────────
+    # Used by focus/auto-pause logic and the "game not running" indicator.
+    #   GAME_NAME      → friendly display name shown in the UI
+    #   GAME_PROCESSES → list of substrings matched (case-insensitive) against
+    #                    the focused window's process name. First hit wins.
+    GAME_NAME      = "FiveM"
+    GAME_PROCESSES = ["fivem", "gta"]
+    # Examples:
+    #   Minecraft        → GAME_PROCESSES = ["javaw", "minecraft"]
+    #   Rust             → GAME_PROCESSES = ["rustclient"]
+    #   Cyberpunk 2077   → GAME_PROCESSES = ["cyberpunk2077"]
+    #
+    # In your worker / focus code, call:
+    #     from bot import is_process_focused, is_process_running
+    #     focused = is_process_focused(self.GAME_PROCESSES)
+    #     running = is_process_running(self.GAME_PROCESSES)
+
+    # ── optional: hub-card extras ─────────────────────────────────────────────
+    # GAME_ICON_PATH  — small image shown next to the plugin name on the hub
+    #                   card. Relative paths resolve against plugins/ first,
+    #                   then the hub exe directory. Any PIL-readable format.
+    # GAME_LAUNCH_CMD — fires when the user clicks the ▶ button on the card.
+    #                   String (shell-parsed) OR list (no shell) OR a single
+    #                   executable path.
+    GAME_ICON_PATH  = "icons/fivem.png"
+    GAME_LAUNCH_CMD = "C:/Games/FiveM/FiveM.exe"
+
+    # ── optional: richer GAME_PROCESSES entries ───────────────────────────────
+    # In addition to plain substring matchers, each entry can be a dict with
+    # ``process`` and/or ``window`` substring fields. Both fields (if set)
+    # must match for the entry to be a hit. Useful for distinguishing apps
+    # that share a process name (e.g. javaw.exe across many Java games).
+    #     GAME_PROCESSES = [
+    #         {"process": "javaw", "window": "Minecraft 1."},
+    #         "rust",   # plain strings still supported alongside dicts
+    #     ]
+
+    # ── optional: required-game gating ────────────────────────────────────────
+    # When True, the hub card is dimmed and unclickable while the target game
+    # is not running. Useful for plugins that genuinely can't function
+    # without the game open.
+    GAME_REQUIRED = False
+
+    # ── required for hub Export/Import ────────────────────────────────────────
+    # Path to the plugin's single config file, relative to cfg/ (or absolute).
+    # Setting this enables the right-click "Export config…" / "Import config…"
+    # entries on the plugin's hub card.
+    CONFIG_PATH = "myplugin_config.json"
+
+    # ── optional: cross-plugin pubsub ─────────────────────────────────────────
+    # Plugins can talk to each other without importing each other directly via
+    # the ``pubsub`` singleton in hub_sdk. Topic format is a free string;
+    # convention is ``<source>.<event>``.
+    #     from hub_sdk import pubsub
+    #     pubsub.publish("needs.food_low", {"value": 25})
+    #     unsub = pubsub.subscribe("needs.food_low",
+    #                              lambda p: print(p["value"]))
+    # Callbacks fire on the publisher's thread — route through a pyqtSignal or
+    # QTimer.singleShot if you need to touch widgets.
+
+    # ── hub-level panic topics ────────────────────────────────────────────────
+    # The hub installs panic hotkeys (default ctrl+shift+s/p/r) that publish:
+    #     hub.stop_all   — every plugin should stop
+    #     hub.pause_all  — every plugin should pause
+    #     hub.resume_all — every plugin should resume
+
+    # ── schedule helper ───────────────────────────────────────────────────────
+    # Gate your worker to a daily/weekly window with one call:
+    #     from hub_sdk import is_in_window
+    #     if not is_in_window("22:00", "04:00", ["fri", "sat"]):
+    #         time.sleep(1.0); continue   # overnight Fri/Sat only
+
+    # ── vision plugin SDK (detector.py) ───────────────────────────────────────
+    # New backend-pluggable detection:
+    #     from detector import Detector, ColorClusterDetector, TemplateMatchDetector
+    # ColorClusterDetector wraps the existing build_color_mask + connected
+    # components pipeline. TemplateMatchDetector is a slot for an OpenCV /
+    # ONNX matcher you supply via match_fn. Subclass Detector to write your
+    # own backend.
+
+    # ── community plugin marker ───────────────────────────────────────────────
+    # Plugins loaded from plugins/community/ are auto-tagged "Community" and
+    # require a one-time trust prompt on first sight. The hub stores approval
+    # in cfg/hub_settings.json under "approved_community".
+
     def build_page(self, nav_back) -> QWidget:
         """
         Required. Return the QWidget shown when the card is opened.
@@ -64,6 +149,20 @@ class Plugin(PluginBase):
         Optional. Called before the plugin is destroyed on hub Refresh or
         per-plugin Reload. Stop background threads, listeners, and timers here.
         Default: no-op.
+
+        IMPORTANT — on_unload may run on a HALF-CONSTRUCTED instance.
+        If your __init__ raises partway through, the hub still calls
+        on_unload() so it can tear down whatever __init__ already started
+        (threads, listeners, timers). That means every attribute you touch
+        here might not exist yet. Always use defensive access:
+
+            listener = getattr(self, "_listener", None)
+            if listener is not None:
+                listener.stop()
+
+        Wrap each teardown step in its own try/except so one failure
+        doesn't skip the rest. If on_unload isn't crash-safe, an errored
+        plugin leaks orphan threads that can hard-crash the next refresh.
         """
         pass
 ```
@@ -202,13 +301,49 @@ def _start_poll(self):
 
 Stop everything here so a hot-reload doesn't leave orphaned threads running in the background.
 
+**`on_unload` must be crash-safe on a half-constructed instance.** If your
+`__init__` throws partway through, the hub still calls `on_unload()` to tear
+down whatever already started — so attributes set later in `__init__` may not
+exist. Use `getattr(...)` and wrap each step in its own `try/except`. A plugin
+whose `on_unload` is *not* defensive can leak orphan threads/listeners that
+hard-crash the next hub refresh.
+
 ```python
 def on_unload(self):
-    self._hk_gen += 1        # kills the poll thread's while loop
-    _worker.stop()            # sets worker.active = False
-    if self._listener:
-        self._listener.stop() # stops any pynput Listener
+    # Bounded, defensive teardown — tolerates missing attributes.
+    try: _worker.stop()                       # module-level worker
+    except Exception: pass
+
+    listener = getattr(self, "_listener", None)
+    if listener is not None:
+        self._listener = None
+        try: listener.stop()
+        except Exception: pass
+        try: listener.join(timeout=1.0)       # wait for the Win32 hook to die
+        except Exception: pass
+
+    for attr in ("_overlay_timer", "_poll_timer"):
+        t = getattr(self, attr, None)
+        if t is not None:
+            try: t.stop()
+            except Exception: pass
+
+    # Detach pubsub subscriptions
+    for unsub in getattr(self, "_pubsub_unsubs", []) or []:
+        try: unsub()
+        except Exception: pass
+
+    # Disconnect bridge signals so a lingering worker can't fire into
+    # deleted widgets
+    for sig in (_bridge.update, _bridge.toggle):
+        try: sig.disconnect()
+        except Exception: pass
 ```
+
+Why the `join(timeout=...)`: `Listener.stop()` only *requests* the Win32 hook
+thread to exit. Without joining, the new plugin instance after a refresh
+installs its hook alongside the old one — both fire, and disabled hotkeys can
+still trigger. Always `stop()` then `join()`.
 
 ---
 
