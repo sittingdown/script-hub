@@ -79,6 +79,10 @@ _DEF = {
     "max_round_wait":    12.0,
     "stuck_recovery_s":  2.5,
     "scan_hard_timeout": 30.0,
+    # Round-end debouncing — guards against single-frame glitches at stretched
+    # resolutions where the marker / icon reads briefly flicker.
+    "marker_close_streak": 2,    # consecutive closed marker reads needed
+    "min_round_s":         0.0,  # minimum round runtime, 0 = disabled
 
     # Minigame marker — optional safety net.
     # If configured, the bot watches this region for the marker color while
@@ -95,8 +99,8 @@ _DEF = {
     # Food / drink break — pause every N minutes, press eat + drink keys,
     # wait for the consume animations, then resume.
     "fd_break_enabled":  False,
-    "fd_interval_min":   10.0,    # how often a break happens
-    "fd_duration_s":     5.0,     # how long the bot stays paused
+    "fd_interval_min":   45.0,    # how often a break happens
+    "fd_duration_s":     15.0,     # how long the bot stays paused
     "fd_eat_key":        "4",
     "fd_drink_key":      "5",
     "fd_eat_first":      True,    # press eat before drink (vs both interleaved)
@@ -403,6 +407,7 @@ class _Worker:
                 return False
             _press_key(k, hold=0.06)
             time.sleep(0.25)
+            _press_key(k, hold=0.06)
 
         # Wait out the consume animations (cooldown bar fills during the wait)
         self._cd_sleep(duration, "food / drink break")
@@ -538,10 +543,17 @@ class _Worker:
                 stuck_attempts = 0
                 stuck_thresh  = float(cfg.get("stuck_recovery_s", 2.5))
                 hard_timeout  = float(cfg.get("scan_hard_timeout", 30.0))
+                min_round_s   = float(cfg.get("min_round_s", 0.0))
                 marker_on     = _minigame_marker_configured()
                 marker_was_open      = False
                 marker_check_iv      = 0.4         # seconds between marker probes
                 last_marker_check    = scan_start - marker_check_iv  # check first iter
+                # Debounce — require N consecutive closed reads. At stretched
+                # resolutions a single-frame interpolation can briefly drop
+                # the marker below threshold; one bad read shouldn't end
+                # the round.
+                marker_close_streak  = 0
+                marker_close_target  = max(1, int(cfg.get("marker_close_streak", 2)))
                 # offset cycle for repeated force-clicks — try different
                 # parts of the cluster's icon body each time
                 _OFFSETS = [(0, 0), (-15, -15), (15, 15),
@@ -561,12 +573,17 @@ class _Worker:
                         last_marker_check = now
                         is_open = _minigame_open()
                         if is_open is True:
-                            marker_was_open = True
-                            seen_anything   = True   # marker confirms minigame is up
-                            last_seen       = now
+                            marker_was_open      = True
+                            seen_anything        = True
+                            last_seen            = now
+                            marker_close_streak  = 0   # reset on any open read
                         elif is_open is False and marker_was_open:
-                            # Marker disappeared after being seen → minigame closed
-                            break
+                            marker_close_streak += 1
+                            # Require N consecutive "closed" reads before
+                            # ending the round, AND respect min_round_s.
+                            if (marker_close_streak >= marker_close_target
+                                    and (now - scan_start) >= min_round_s):
+                                break
 
                     img = capture_region(region)
                     mask = build_color_mask(img, colors, tolerance)
@@ -606,6 +623,27 @@ class _Worker:
                         elif stuck_since is None:
                             stuck_since = now
                         elif (now - stuck_since) >= stuck_thresh:
+                            # After a few failed offset attempts, the dedupe
+                            # list itself is the problem — every nearby spot
+                            # is "already clicked" so the cluster can never be
+                            # re-targeted at its true centroid. Clear out
+                            # _clicked entries inside ~2× dedupe radius of any
+                            # current cluster so the cluster is treated as
+                            # fresh on the next iteration. Common at stretched
+                            # resolutions where the click lands slightly off.
+                            if stuck_attempts >= 3 and centers:
+                                r2 = (dedupe_r * 2) * (dedupe_r * 2)
+                                cluster_pts = [(rgx + cx, rgy + cy)
+                                               for cx, cy in centers]
+                                self._clicked = [
+                                    (px, py) for px, py in self._clicked
+                                    if not any(
+                                        (px - cx) * (px - cx)
+                                        + (py - cy) * (py - cy) < r2
+                                        for cx, cy in cluster_pts
+                                    )
+                                ]
+
                             target = None
                             if self._clicked:
                                 # pick the cluster furthest from any prior click
@@ -641,7 +679,8 @@ class _Worker:
                         stuck_since = None
                         stuck_attempts = 0
                         if seen_anything:
-                            if (now - last_seen) >= gone_for:
+                            if ((now - last_seen) >= gone_for
+                                    and (now - scan_start) >= min_round_s):
                                 break
                         elif max_wait > 0 and (now - scan_start) >= max_wait:
                             # icons never appeared — bail and try again
@@ -794,6 +833,17 @@ _TIP = {
     "fd_duration_s": (
         "How long the bot stays paused per food/drink break. Should be at "
         "least as long as your in-game eat + drink animations."
+    ),
+    "marker_close_streak": (
+        "Number of consecutive 'marker absent' reads required before the "
+        "round is declared over. Higher = more tolerant of single-frame "
+        "glitches (helps on stretched / non-native resolutions). 1 disables "
+        "debouncing."
+    ),
+    "min_round_s": (
+        "Minimum seconds a round must run before it's allowed to end, even "
+        "if the marker or icon checks say it's done. Prevents 'press E "
+        "twice in a row' bugs from a brief marker dropout. 0 disables."
     ),
 }
 
@@ -1507,11 +1557,13 @@ class Plugin(PluginBase):
         root.addSpacing(8)
 
         for label_text, key, lo, hi, step, fmt in [
-            ("Min Cluster Pixels",     "min_cluster_px",     5,  200,   1,  "{:.0f}"),
-            ("Dedupe Radius (px)",     "dedupe_radius",     10,  100,   5,  "{:.0f}"),
-            ("Max Targets / Scan",     "max_targets",        1,   25,   1,  "{:.0f}"),
-            ("Round-end Idle (s)",     "minigame_gone_for", 0.2, 3.0, 0.1,  "{:.1f}"),
-            ("Stuck Recovery (s)",     "stuck_recovery_s",  0.0, 10.0, 0.5, "{:.1f}"),
+            ("Min Cluster Pixels",     "min_cluster_px",      5,  200,   1,  "{:.0f}"),
+            ("Dedupe Radius (px)",     "dedupe_radius",      10,  100,   5,  "{:.0f}"),
+            ("Max Targets / Scan",     "max_targets",         1,   25,   1,  "{:.0f}"),
+            ("Round-end Idle (s)",     "minigame_gone_for",  0.2, 3.0, 0.1,  "{:.1f}"),
+            ("Stuck Recovery (s)",     "stuck_recovery_s",   0.0, 10.0, 0.5, "{:.1f}"),
+            ("Marker Close Streak",    "marker_close_streak", 1,   10,   1,  "{:.0f}"),
+            ("Min Round (s)",          "min_round_s",        0.0, 10.0, 0.5, "{:.1f}"),
         ]:
             is_int = step >= 1 and fmt == "{:.0f}"
             st = NumericStepper(cfg.get(key, _DEF[key]),
