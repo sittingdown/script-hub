@@ -31,11 +31,8 @@ plugins/
 | Plugin | Description |
 |--------|-------------|
 | **Magnet Minigame** | Auto-clicks the magnet hacking minigame icons. Region + color detection, food/drink breaks, schedules, status overlay. |
-| **Needs Test** | OCR-based food/water % monitor with optional auto-consume. |
 | **Macro Recorder** | Record key sequences and replay them on a hotkey. Works in any game. |
-| **Magnet Bot** | Older fishing minigame bot. |
 | **Key Spammer** | Spams a key sequence on repeat. Auto-pauses when the game loses focus. |
-| **Weed Bagging** | Spams a key sequence for the weed bagging job. |
 
 Drop any `.py` plugin into `plugins/` and click **Refresh**. Community plugins go in `plugins/community/` and are prompted for trust on first load.
 
